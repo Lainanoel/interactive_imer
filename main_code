@@ -156,6 +156,16 @@ draw_resid_plots <- function(mod) {
        xlab = "Residuals", main = "Histogram of residuals")
 }
 
+# A collapsible, copy-able code block tied to a renderText output ------------
+code_panel <- function(out_id, label = "R code") {
+  tags$details(class = "uf-codewrap",
+               tags$summary(tags$b(sprintf("\u25b6 %s (copy & run in R)", label))),
+               tags$button("Copy code", class = "btn btn-default uf-copy",
+                           onclick = sprintf("copyCode('%s', this)", out_id)),
+               verbatimTextOutput(out_id)
+  )
+}
+
 # ===========================================================================
 #  UI
 # ===========================================================================
@@ -210,7 +220,26 @@ ui <- fluidPage(
     .alert-danger  { border-left: 5px solid var(--uf-orange); }
     .alert-info    { border-left: 5px solid var(--uf-blue); }
     .uf-dl { margin: 6px 6px 12px 0; }
-  ", UF_ORANGE, UF_BLUE, UF_CHARCOAL, UF_PLATINUM, UF_BLUE_LT)))),
+    .uf-copy { margin: 4px 0 0 0; font-size: 12px; padding: 3px 10px; }
+    .uf-codewrap { margin: 6px 0 14px 0; }
+  ", UF_ORANGE, UF_BLUE, UF_CHARCOAL, UF_PLATINUM, UF_BLUE_LT))),
+            tags$script(HTML("
+      function copyCode(id, btn){
+        var el = document.getElementById(id);
+        if(!el){ return; }
+        var txt = el.innerText || el.textContent || '';
+        var done = function(){ var o = btn.innerHTML; btn.innerHTML = 'Copied \u2713';
+                               setTimeout(function(){ btn.innerHTML = o; }, 1200); };
+        if(navigator.clipboard && navigator.clipboard.writeText){
+          navigator.clipboard.writeText(txt).then(done, function(){});
+        } else {
+          var ta = document.createElement('textarea'); ta.value = txt;
+          document.body.appendChild(ta); ta.select();
+          try { document.execCommand('copy'); done(); } catch(e){}
+          document.body.removeChild(ta);
+        }
+      }
+    "))),
 
   div(class = "uf-header",
       h1("Quick Mixed-Model Review"),
@@ -318,15 +347,19 @@ ui <- fluidPage(
                           "spread that grows with the mean (a hint to try a ",
                           "log/sqrt transform)."),
                  plotOutput("explore_plot", height = "460px"),
+                 code_panel("code_explore", "Descriptive plot code"),
                  h4("Interaction plot (raw means)"),
                  helpText("Non-parallel lines suggest an interaction \u2014 a ",
                           "reason to tick 'Include interactions'. Needs \u2265 2 ",
                           "fixed effects."),
-                 plotOutput("interaction_plot", height = "440px")),
+                 plotOutput("interaction_plot", height = "440px"),
+                 code_panel("code_interaction", "Interaction plot code")),
 
         tabPanel("Model & code",
                  h4("R code for this model"),
                  verbatimTextOutput("code_block"),
+                 tags$button("Copy code", class = "btn btn-default uf-copy",
+                             onclick = "copyCode('code_block', this)"),
                  downloadButton("dl_code", "Download .R", class = "btn-default uf-dl"),
                  h4("Model summary"),
                  verbatimTextOutput("model_summary")),
@@ -342,22 +375,26 @@ ui <- fluidPage(
                  h4("Random-effects normality (Q-Q of BLUPs)"),
                  helpText("Mixed models assume the random effects are normally ",
                           "distributed. Points should hug the line."),
-                 plotOutput("ranef_qq", height = "420px")),
+                 plotOutput("ranef_qq", height = "420px"),
+                 code_panel("code_fit", "Fit, variance & random-effects code")),
 
         tabPanel("ANOVA",
                  h4(textOutput("anova_title", inline = TRUE)),
-                 verbatimTextOutput("anova_table")),
+                 verbatimTextOutput("anova_table"),
+                 code_panel("code_anova", "ANOVA code")),
 
         tabPanel("Residuals",
                  h4("Diagnostic plots"),
                  plotOutput("resid_plot", height = "560px"),
                  downloadButton("dl_resid", "Download PNG", class = "btn-default uf-dl"),
                  htmlOutput("resid_help"),
+                 code_panel("code_resid", "Residual diagnostics code"),
                  tags$hr(),
                  h4("Influence by group (Cook's distance)"),
                  uiOutput("infl_ui"),
                  plotOutput("cook_plot", height = "380px"),
-                 htmlOutput("cook_help")),
+                 htmlOutput("cook_help"),
+                 code_panel("code_cook", "Cook's distance code")),
 
         tabPanel("EMMeans & post-hoc",
                  h4("Estimated marginal means"),
@@ -370,19 +407,22 @@ ui <- fluidPage(
                  DT::dataTableOutput("cld_table"),
                  downloadButton("dl_cld", "Download CSV", class = "btn-default uf-dl"),
                  helpText("Means sharing a letter are not significantly ",
-                          "different at the chosen adjustment level.")),
+                          "different at the chosen adjustment level."),
+                 code_panel("code_emm", "EMMeans + post-hoc + cld code")),
 
         tabPanel("EMMeans plot",
                  h4("Estimated means with letter groupings"),
                  plotOutput("emm_plot", height = "520px"),
-                 downloadButton("dl_emmplot", "Download PNG", class = "btn-default uf-dl")),
+                 downloadButton("dl_emmplot", "Download PNG", class = "btn-default uf-dl"),
+                 code_panel("code_emmplot", "EMMeans plot code")),
 
         tabPanel("Compare models",
                  helpText("Use 'Save model for comparison' on a fitted model, ",
                           "then change the spec, Run again, and compare here."),
                  htmlOutput("compare_status"),
                  h4("Likelihood-ratio test (saved vs current)"),
-                 verbatimTextOutput("compare_lrt"))
+                 verbatimTextOutput("compare_lrt"),
+                 code_panel("code_compare", "Model comparison code"))
       )
     )
   )
@@ -673,7 +713,8 @@ server <- function(input, output, session) {
     use_reml <- input$estimator == "reml"
 
     fit <- tryCatch(
-      lmerTest::lmer(fml, data = model_df, REML = use_reml),
+      lmerTest::lmer(fml, data = model_df, REML = use_reml,
+                     na.action = na.omit),
       error = function(e) e
     )
     if (inherits(fit, "error")) {
@@ -682,8 +723,13 @@ server <- function(input, output, session) {
       rv$fit <- NULL; rv$code <- NULL; return()
     }
 
-    # --- Soft diagnostics (singular / convergence) --------------------------
+    # --- Soft diagnostics (singular / convergence / dropped rows) -----------
     notes <- character(0)
+    n_drop <- nrow(model_df) - stats::nobs(fit)
+    if (n_drop > 0)
+      notes <- c(notes, sprintf(
+        "%d of %d row(s) were dropped for missing values in the model variables (listwise deletion). The model used %d row(s).",
+        n_drop, nrow(model_df), stats::nobs(fit)))
     if (isTRUE(lme4::isSingular(fit)))
       notes <- c(notes,
                  "Singular fit: the random-effects structure may be too complex for the data (e.g. drop the random slope).")
@@ -716,7 +762,7 @@ server <- function(input, output, session) {
       "library(multcomp)",
       "",
       "# --- Fit the mixed model -------------------------------------------",
-      sprintf("mod <- lmer(%s,\n            data = dat, REML = %s)", fml_str,
+      sprintf("mod <- lmer(%s,\n            data = dat, REML = %s, na.action = na.omit)", fml_str,
               if (use_reml) "TRUE" else "FALSE"),
       "summary(mod)",
       "",
@@ -754,6 +800,184 @@ server <- function(input, output, session) {
     filename = function() "mixed_model_code.R",
     content  = function(file) writeLines(rv$code %||% "# run an analysis first", file)
   )
+
+  # ==========================================================================
+  #  Per-section reproducible code (copy & run against your own `dat`/`mod`)
+  # ==========================================================================
+  HDR <- "# Assumes: `dat` is your data frame, and `mod` is the fitted model\n# from the 'Model & code' tab (run that block first).\n"
+
+  emm_spec_str <- function() {
+    ev <- input$emmvars
+    if (length(ev)) paste("~", paste(bq(ev), collapse = " * ")) else "~ <factor>"
+  }
+  emm_call_str <- function() {
+    bt <- rv$fit$transform != "none" && isTRUE(input$backtransform)
+    tr <- tran_for_emmeans(rv$fit$transform)
+    if (bt && !is.null(tr))
+      sprintf('emm <- emmeans(ref_grid(mod, tran = "%s"), %s,\n               type = "response", level = %s)',
+              tr, emm_spec_str(), format(input$conf))
+    else
+      sprintf('emm <- emmeans(mod, %s, type = "%s", level = %s)',
+              emm_spec_str(), if (bt) "response" else "link", format(input$conf))
+  }
+
+  # ---- Explore: descriptive plot ----
+  output$code_explore <- renderText({
+    resp <- input$response; fx <- input$fixed
+    if (is.null(resp) || length(fx) < 1)
+      return("# Pick a response variable and at least one fixed effect.")
+    df <- dataset(); x <- fx[1]
+    cat_x <- is.factor(df[[x]]) || is.character(df[[x]])
+    geom <- if (cat_x)
+      "  geom_boxplot(outlier.shape = NA) +\n  geom_jitter(width = 0.15, height = 0, alpha = 0.45)"
+    else
+      "  geom_point(alpha = 0.55) +\n  geom_smooth(method = \"loess\", formula = y ~ x, se = FALSE)"
+    facets <- fx[-1][vapply(fx[-1],
+                            function(v) is.factor(df[[v]]) || is.character(df[[v]]), logical(1))]
+    fl <- if (length(facets) >= 2)
+      sprintf(" +\n  facet_grid(%s ~ %s)", bq(facets[1]), bq(facets[2]))
+    else if (length(facets) == 1)
+      sprintf(" +\n  facet_wrap(~ %s)", bq(facets[1]))
+    else ""
+    paste0("library(ggplot2)\n",
+           sprintf("ggplot(dat, aes(x = %s, y = %s)) +\n", bq(x), bq(resp)),
+           geom, " +\n  theme_minimal()", fl)
+  })
+
+  # ---- Explore: interaction plot ----
+  output$code_interaction <- renderText({
+    resp <- input$response; fx <- input$fixed
+    if (is.null(resp) || length(fx) < 2)
+      return("# Select at least two fixed effects for an interaction plot.")
+    x <- fx[1]; tr <- fx[2]; f3 <- if (length(fx) >= 3) fx[3] else NULL
+    cols <- paste(c(bq(resp), bq(x), bq(tr), if (!is.null(f3)) bq(f3)),
+                  collapse = ", ")
+    grp  <- paste(c(sprintf("X = %s", bq(x)), sprintf("G = %s", bq(tr)),
+                    if (!is.null(f3)) sprintf("F3 = %s", bq(f3))), collapse = ", ")
+    facet <- if (!is.null(f3)) " +\n  facet_wrap(~ F3)" else ""
+    paste0("library(ggplot2)\n",
+           sprintf("d  <- dat[complete.cases(dat[, c(%s)]), ]\n", gsub("`", "\"", cols)),
+           sprintf("ag <- aggregate(d[[%s]], by = list(%s),\n", paste0("\"", resp, "\""), grp),
+           "                FUN = function(z) mean(z, na.rm = TRUE))\n",
+           "names(ag)[ncol(ag)] <- \"mean\"\n",
+           "ggplot(ag, aes(X, mean, colour = G, group = G)) +\n",
+           "  geom_line(linewidth = 1) + geom_point(size = 2.6)", facet,
+           " +\n  labs(x = \"", x, "\", colour = \"", tr, "\", y = \"mean ", resp, "\") +\n",
+           "  theme_minimal()")
+  })
+
+  # ---- Fit & variance ----
+  output$code_fit <- renderText({
+    if (is.null(rv$fit)) return("# Run a model first.")
+    g1 <- rv$fit$random[1]
+    paste0(HDR, "\n",
+           "# Fit statistics\n",
+           "AIC(mod); BIC(mod); logLik(mod); deviance(mod)\n",
+           "performance::r2(mod)    # marginal & conditional R^2\n",
+           "performance::icc(mod)   # intraclass correlation\n\n",
+           "# Variance components\n",
+           "as.data.frame(VarCorr(mod))\n\n",
+           "# Random-effects estimates (caterpillar plot)\n",
+           "lattice::dotplot(ranef(mod, condVar = TRUE))\n\n",
+           "# Random-effects normality (Q-Q of BLUPs)\n",
+           sprintf("re <- ranef(mod)[[\"%s\"]][[1]]\n", g1),
+           "qqnorm(re); qqline(re)")
+  })
+
+  # ---- ANOVA ----
+  output$code_anova <- renderText({
+    if (is.null(rv$fit)) return("# Run a model first.")
+    paste0(HDR, "\n", sprintf('anova(mod, ddf = "%s")', rv$fit$ddf))
+  })
+
+  # ---- Residual diagnostics ----
+  output$code_resid <- renderText({
+    if (is.null(rv$fit)) return("# Run a model first.")
+    paste0(HDR, "\n",
+           "r <- resid(mod); f <- fitted(mod)\n",
+           "op <- par(mfrow = c(2, 2))\n",
+           "plot(f, r, main = \"Residuals vs Fitted\"); abline(h = 0, lty = 2)\n",
+           "lines(lowess(f, r), col = 2, lwd = 2)\n",
+           "qqnorm(r); qqline(r, col = 2, lwd = 2)\n",
+           "plot(f, sqrt(abs(scale(r))), main = \"Scale-Location\")\n",
+           "lines(lowess(f, sqrt(abs(scale(r)))), col = 2, lwd = 2)\n",
+           "hist(r, breaks = \"FD\", main = \"Histogram of residuals\")\n",
+           "par(op)")
+  })
+
+  # ---- Cook's distance ----
+  output$code_cook <- renderText({
+    if (is.null(rv$fit)) return("# Run a model first.")
+    g <- (input$infl_group %||% rv$fit$random[1])
+    paste0(HDR, "\n",
+           "library(influence.ME)\n",
+           sprintf('infl <- influence(mod, group = "%s")  # leave-one-group-out (slow)\n', g),
+           "cooks.distance(infl)\n",
+           "plot(infl, which = \"cook\", sort = TRUE,\n",
+           "     cutoff = 4 / length(cooks.distance(infl)))")
+  })
+
+  # ---- EMMeans + post-hoc + cld ----
+  output$code_emm <- renderText({
+    if (is.null(rv$fit)) return("# Run a model first.")
+    if (length(input$emmvars) < 1)
+      return("# Choose one or more categorical fixed effects for EMMeans.")
+    paste0(HDR, "\nlibrary(emmeans); library(multcomp)\n\n",
+           emm_call_str(), "\n",
+           "summary(emm)\n",
+           sprintf('pairs(emm, adjust = "%s")\n', input$adjust),
+           sprintf('cld(emm, Letters = letters, adjust = "%s", reversed = TRUE)',
+                   input$adjust))
+  })
+
+  # ---- EMMeans plot ----
+  output$code_emmplot <- renderText({
+    if (is.null(rv$fit)) return("# Run a model first.")
+    ev <- input$emmvars
+    if (length(ev) < 1)
+      return("# Choose one or more categorical fixed effects for EMMeans.")
+    bt <- rv$fit$transform != "none" && isTRUE(input$backtransform)
+    yc <- if (bt) "response" else "emmean"
+    base <- paste0(HDR, "\nlibrary(ggplot2); library(multcomp)\n\n",
+                   emm_call_str(), "\n",
+                   sprintf('cl <- as.data.frame(cld(emm, Letters = letters, adjust = "%s", reversed = TRUE))\n',
+                           input$adjust),
+                   "cl$.group <- trimws(cl$.group)\n",
+                   "lcl <- intersect(c(\"lower.CL\",\"asymp.LCL\"), names(cl))[1]\n",
+                   "ucl <- intersect(c(\"upper.CL\",\"asymp.UCL\"), names(cl))[1]\n\n")
+    if (length(ev) == 1) {
+      plt <- paste0(
+        sprintf("ggplot(cl, aes(%s, %s)) +\n", bq(ev[1]), yc),
+        "  geom_point(size = 3) +\n",
+        "  geom_errorbar(aes(ymin = cl[[lcl]], ymax = cl[[ucl]]), width = .15) +\n",
+        sprintf("  geom_text(aes(label = .group, y = cl[[ucl]]), vjust = -.8, fontface = \"bold\") +\n"),
+        "  theme_minimal()")
+    } else {
+      facet <- if (length(ev) >= 3) sprintf(" +\n  facet_wrap(~ %s)", bq(ev[3])) else ""
+      plt <- paste0(
+        sprintf("ggplot(cl, aes(%s, %s, colour = %s, group = %s)) +\n",
+                bq(ev[1]), yc, bq(ev[2]), bq(ev[2])),
+        "  geom_point(size = 3, position = position_dodge(.6)) +\n",
+        "  geom_errorbar(aes(ymin = cl[[lcl]], ymax = cl[[ucl]]),\n",
+        "                width = .2, position = position_dodge(.6)) +\n",
+        "  geom_text(aes(label = .group, y = cl[[ucl]]), vjust = -.8,\n",
+        "            position = position_dodge(.6), show.legend = FALSE)", facet, " +\n",
+        "  theme_minimal()")
+    }
+    paste0(base, plt)
+  })
+
+  # ---- Model comparison ----
+  output$code_compare <- renderText({
+    if (is.null(rv$modelA))
+      return("# Save a model (button in the sidebar) to use as baseline 'mod_A'.")
+    paste0(
+      "# mod_A = your saved baseline; mod = your current model.\n",
+      "# anova() refits REML models with ML; the LRT is valid only for\n",
+      "# nested models fit on identical data.\n",
+      "anova(mod_A, mod)\n",
+      "AIC(mod_A, mod); BIC(mod_A, mod)")
+  })
 
   # -- Fit statistics & variance components ----------------------------------
   output$fit_table <- DT::renderDataTable({
