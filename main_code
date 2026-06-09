@@ -1,0 +1,1110 @@
+# ============================================================================
+#  Quick Mixed-Model Review  —  R Shiny app (lmerTest / emmeans)
+# ----------------------------------------------------------------------------
+#  A lightweight, interactive tool for a fast look at linear mixed models.
+#
+#  Features
+#    * Drop-down selection of response, fixed effects (hard max 3), random
+#      effects, optional random slope, REML/ML toggle
+#    * Transformations: log, log1p, sqrt, inverse(1/y), arcsine-sqrt
+#    * Data-preview tab: structure, head, missing values, group balance
+#    * ANOVA via Kenward-Roger ddf (default) or Satterthwaite, with graceful
+#      fallback if pbkrtest is unavailable
+#    * Model fit stats: AIC / BIC / logLik / deviance, marginal &
+#      conditional R-squared, ICC, variance components, singular/convergence
+#      diagnostics, random-effects (caterpillar) plot
+#    * Residual diagnostic plots + plain-language interpretation
+#    * EMMeans post-hoc, compact letter display (cld), letter-annotated plot
+#    * Optional back-transformation of EMMeans, adjustable confidence level
+#    * Download buttons for tables (CSV), plots (PNG) and the generated R code
+#    * Reset button to start a fresh comparison
+#    * Guards so an empty / oversized fixed/random spec produces a friendly
+#      warning instead of a crash
+#
+#  Install once:
+#    install.packages(c("shiny","shinyjs","lmerTest","emmeans","pbkrtest",
+#                       "multcomp","multcompView","ggplot2","DT","lattice",
+#                       "performance","influence.ME"))
+#    # 'performance' (R2/ICC) and 'influence.ME' (Cook's distance) are optional;
+#    # the app degrades gracefully if they are missing.
+#  Run:
+#    shiny::runApp("app.R")
+# ============================================================================
+
+library(shiny)
+library(shinyjs)
+library(lmerTest)      # loads lme4; provides Kenward-Roger / Satterthwaite ddf
+library(emmeans)
+library(multcomp)      # cld() generic
+library(multcompView)  # letter grouping engine
+library(ggplot2)
+library(DT)
+library(lattice)       # ranef caterpillar plot
+
+# Optional packages (R2 / ICC / influence) ---------------------------------
+HAS_PERFORMANCE <- requireNamespace("performance",  quietly = TRUE)
+HAS_MUMIN       <- requireNamespace("MuMIn",        quietly = TRUE)
+HAS_PBKRTEST    <- requireNamespace("pbkrtest",     quietly = TRUE)
+HAS_INFLUENCEME <- requireNamespace("influence.ME", quietly = TRUE)
+
+# Default degrees-of-freedom method requested by the brief ------------------
+DDF_DEFAULT <- if (HAS_PBKRTEST) "Kenward-Roger" else "Satterthwaite"
+MAX_FIXED   <- 3L
+
+# University of Florida brand palette ---------------------------------------
+#   Orange  #FA4616 (Pantone 172)   Blue #0021A5 (Pantone 287)
+UF_ORANGE   <- "#FA4616"
+UF_BLUE     <- "#0021A5"
+UF_CHARCOAL <- "#222222"   # "Swamp Charcoal" for body text
+UF_PLATINUM <- "#F8F9FA"   # light neutral background
+UF_BLUE_LT  <- "#cdd3ef"   # tint of blue for fills
+
+# ---------------------------------------------------------------------------
+#  Helpers: formula construction
+# ---------------------------------------------------------------------------
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# Backtick a name so non-syntactic columns (spaces, leading digits, etc.)
+# can't break the model formula. Idempotent-safe for already-clean names.
+bq <- function(x) sprintf("`%s`", x)
+
+build_lhs <- function(response, transform) {
+  r <- bq(response)
+  switch(transform,
+         "none"    = r,
+         "log"     = sprintf("log(%s)", r),
+         "log1p"   = sprintf("log1p(%s)", r),
+         "sqrt"    = sprintf("sqrt(%s)", r),
+         "inverse" = sprintf("I(1/%s)", r),
+         "asin"    = sprintf("asin(sqrt(%s))", r),
+         r)
+}
+
+build_random_part <- function(random, slope = NULL) {
+  if (length(random) == 0) return(NULL)
+  if (!is.null(slope) && nzchar(slope)) {
+    paste(sprintf("(1 + %s | %s)", bq(slope), bq(random)), collapse = " + ")
+  } else {
+    paste(sprintf("(1 | %s)", bq(random)), collapse = " + ")
+  }
+}
+
+build_formula_string <- function(response, transform, fixed, random,
+                                 interactions, slope = NULL) {
+  lhs <- build_lhs(response, transform)
+
+  if (length(fixed) == 0) {
+    fixed_part <- "1"
+  } else if (isTRUE(interactions) && length(fixed) > 1) {
+    fixed_part <- paste(bq(fixed), collapse = " * ")
+  } else {
+    fixed_part <- paste(bq(fixed), collapse = " + ")
+  }
+
+  random_part <- build_random_part(random, slope)
+  paste(lhs, "~", fixed_part, "+", random_part)
+}
+
+# Detect which of a set of variables are categorical in a data frame --------
+is_categorical <- function(df, vars) {
+  vapply(vars, function(v) is.factor(df[[v]]) || is.character(df[[v]]),
+         logical(1))
+}
+
+# Map a UI transform to the emmeans `tran` spec used for back-transformation.
+# log / sqrt are auto-detected by emmeans, but inverse / arcsine / log1p are
+# not, so we name them explicitly. Returns NULL for the no-transform case.
+tran_for_emmeans <- function(transform) {
+  switch(transform,
+         "none"    = NULL,
+         "log"     = "log",
+         "log1p"   = "log1p",
+         "sqrt"    = "sqrt",
+         "inverse" = "inverse",     # 1/mu link, matches I(1/y)
+         "asin"    = "asin.sqrt",   # emmeans built-in arcsine-sqrt transform
+         NULL)
+}
+
+# round numeric columns for display ----------------------------------------
+round_df <- function(d, digits = 4) {
+  num <- vapply(d, is.numeric, logical(1))
+  d[num] <- lapply(d[num], round, digits)
+  d
+}
+
+# Base-graphics residual panel (reused by viewer and PNG download) ----------
+draw_resid_plots <- function(mod) {
+  r    <- resid(mod)
+  fitv <- fitted(mod)
+  op <- par(mfrow = c(2, 2), mar = c(4.5, 4.5, 2.5, 1))
+  on.exit(par(op))
+
+  plot(fitv, r, xlab = "Fitted values", ylab = "Residuals",
+       main = "Residuals vs Fitted", pch = 19, col = UF_BLUE)
+  abline(h = 0, lty = 2, col = "grey40")
+  lines(lowess(fitv, r), col = UF_ORANGE, lwd = 2)
+
+  qqnorm(r, main = "Normal Q-Q", pch = 19, col = UF_BLUE)
+  qqline(r, col = UF_ORANGE, lwd = 2)
+
+  plot(fitv, sqrt(abs(scale(r))), xlab = "Fitted values",
+       ylab = expression(sqrt(abs("std. residuals"))),
+       main = "Scale-Location", pch = 19, col = UF_BLUE)
+  lines(lowess(fitv, sqrt(abs(scale(r)))), col = UF_ORANGE, lwd = 2)
+
+  hist(r, breaks = "FD", col = UF_BLUE_LT, border = "white",
+       xlab = "Residuals", main = "Histogram of residuals")
+}
+
+# ===========================================================================
+#  UI
+# ===========================================================================
+ui <- fluidPage(
+  useShinyjs(),
+  title = "Quick Mixed-Model Review",
+
+  # ---- University of Florida theme ----------------------------------------
+  tags$head(tags$style(HTML(sprintf("
+    :root {
+      --uf-orange: %1$s; --uf-blue: %2$s;
+      --uf-charcoal: %3$s; --uf-platinum: %4$s; --uf-blue-lt: %5$s;
+    }
+    body { background-color: var(--uf-platinum); color: var(--uf-charcoal);
+           font-family: 'Helvetica Neue', Arial, sans-serif; }
+
+    .uf-header { background: var(--uf-blue); color: #fff;
+      padding: 16px 22px; margin: -15px -15px 18px -15px;
+      border-bottom: 6px solid var(--uf-orange); }
+    .uf-header h1 { margin: 0; font-size: 26px; font-weight: 700;
+      letter-spacing: .3px; }
+    .uf-header .uf-sub { color: var(--uf-orange); font-weight: 600;
+      font-size: 14px; margin-top: 2px; }
+
+    .well { background: #fff; border: 1px solid #e3e3e3;
+      border-top: 4px solid var(--uf-orange); border-radius: 6px; }
+
+    .btn-primary { background-color: var(--uf-orange) !important;
+      border-color: var(--uf-orange) !important; color: #fff !important;
+      font-weight: 600; }
+    .btn-primary:hover { background-color: #d83a0f !important;
+      border-color: #d83a0f !important; }
+    .btn-default { background-color: #fff !important;
+      border: 1px solid var(--uf-blue) !important; color: var(--uf-blue) !important;
+      font-weight: 600; }
+    .btn-default:hover { background-color: var(--uf-blue) !important;
+      color: #fff !important; }
+
+    .nav-tabs > li > a { color: var(--uf-blue); font-weight: 600; }
+    .nav-tabs > li.active > a,
+    .nav-tabs > li.active > a:focus,
+    .nav-tabs > li.active > a:hover {
+      color: var(--uf-orange) !important;
+      border-top: 3px solid var(--uf-orange) !important; }
+
+    h4 { color: var(--uf-blue); font-weight: 700; }
+    a { color: var(--uf-blue); }
+    .control-label { color: var(--uf-charcoal); font-weight: 600; }
+    pre { background: #fff; border: 1px solid #e3e3e3;
+      border-left: 4px solid var(--uf-blue); }
+    .alert-warning { border-left: 5px solid var(--uf-orange); }
+    .alert-danger  { border-left: 5px solid var(--uf-orange); }
+    .alert-info    { border-left: 5px solid var(--uf-blue); }
+    .uf-dl { margin: 6px 6px 12px 0; }
+  ", UF_ORANGE, UF_BLUE, UF_CHARCOAL, UF_PLATINUM, UF_BLUE_LT)))),
+
+  div(class = "uf-header",
+      h1("Quick Mixed-Model Review"),
+      div(class = "uf-sub", "lmerTest \u00b7 emmeans  |  University of Florida")),
+
+  sidebarLayout(
+    sidebarPanel(
+      width = 4,
+      div(id = "controls",
+
+          radioButtons("data_source", "Data source",
+                       choices = c("Example data (ChickWeight)" = "example",
+                                   "Upload a CSV file"          = "upload"),
+                       selected = "example"),
+
+          conditionalPanel(
+            condition = "input.data_source == 'upload'",
+            fileInput("file", "Choose CSV file", accept = c(".csv", ".txt")),
+            checkboxInput("header", "Header row", TRUE)
+          ),
+
+          tags$details(
+            tags$summary(tags$b("Variable types (optional)")),
+            helpText("Override how columns are read \u2014 e.g. an ID stored ",
+                     "as a number, or a treatment code read as text."),
+            uiOutput("force_factor_ui"),
+            uiOutput("force_numeric_ui")
+          ),
+
+          tags$hr(),
+
+          uiOutput("response_ui"),
+          selectInput("transform", "Response transformation",
+                      choices = c("None"             = "none",
+                                  "log()"            = "log",
+                                  "log1p()  [log(1+y)]" = "log1p",
+                                  "sqrt()"           = "sqrt",
+                                  "inverse (1/y)"    = "inverse",
+                                  "arcsine-sqrt (proportions)" = "asin"),
+                      selected = "none"),
+
+          uiOutput("fixed_ui"),
+          checkboxInput("interactions",
+                        "Include interactions among fixed effects", FALSE),
+
+          uiOutput("random_ui"),
+
+          # ---- Advanced model options ----
+          tags$details(
+            tags$summary(tags$b("Advanced model options")),
+            uiOutput("slope_ui"),
+            radioButtons("estimator", "Estimator",
+                         choices = c("REML (recommended)" = "reml",
+                                     "ML"                  = "ml"),
+                         selected = "reml", inline = TRUE),
+            selectInput("ddf", "ANOVA denominator df",
+                        choices = c("Kenward-Roger" = "Kenward-Roger",
+                                    "Satterthwaite" = "Satterthwaite"),
+                        selected = DDF_DEFAULT)
+          ),
+
+          tags$hr(),
+
+          uiOutput("emm_ui"),
+          checkboxInput("backtransform",
+                        "Back-transform EMMeans to response scale", TRUE),
+          selectInput("adjust", "Post-hoc p-value adjustment",
+                      choices = c("Tukey"      = "tukey",
+                                  "Sidak"      = "sidak",
+                                  "Bonferroni" = "bonferroni",
+                                  "Holm"       = "holm",
+                                  "None"       = "none"),
+                      selected = "tukey"),
+          sliderInput("conf", "Confidence level", min = 0.80, max = 0.99,
+                      value = 0.95, step = 0.01),
+
+          tags$hr(),
+          actionButton("run", "Run analysis", class = "btn-primary"),
+          actionButton("reset", "Reset", class = "btn-default"),
+          actionButton("save_model", "Save model for comparison",
+                       class = "btn-default", style = "margin-top:8px;")
+      )
+    ),
+
+    mainPanel(
+      width = 8,
+      uiOutput("message_box"),
+
+      tabsetPanel(
+        id = "tabs",
+
+        tabPanel("Data",
+                 h4("Dimensions"),
+                 verbatimTextOutput("data_dims"),
+                 h4("Structure"),
+                 verbatimTextOutput("data_str"),
+                 h4("Missing values per column"),
+                 DT::dataTableOutput("data_na"),
+                 h4("Preview (first 10 rows)"),
+                 DT::dataTableOutput("data_head")),
+
+        tabPanel("Explore (raw data)",
+                 h4("Response vs fixed effect(s)"),
+                 helpText("Raw, pre-model view. Look for outliers and for a ",
+                          "spread that grows with the mean (a hint to try a ",
+                          "log/sqrt transform)."),
+                 plotOutput("explore_plot", height = "460px"),
+                 h4("Interaction plot (raw means)"),
+                 helpText("Non-parallel lines suggest an interaction \u2014 a ",
+                          "reason to tick 'Include interactions'. Needs \u2265 2 ",
+                          "fixed effects."),
+                 plotOutput("interaction_plot", height = "440px")),
+
+        tabPanel("Model & code",
+                 h4("R code for this model"),
+                 verbatimTextOutput("code_block"),
+                 downloadButton("dl_code", "Download .R", class = "btn-default uf-dl"),
+                 h4("Model summary"),
+                 verbatimTextOutput("model_summary")),
+
+        tabPanel("Fit & variance",
+                 h4("Fit statistics"),
+                 DT::dataTableOutput("fit_table"),
+                 htmlOutput("fit_help"),
+                 h4("Variance components"),
+                 DT::dataTableOutput("vc_table"),
+                 h4("Random-effects estimates (caterpillar plot)"),
+                 plotOutput("ranef_plot", height = "420px"),
+                 h4("Random-effects normality (Q-Q of BLUPs)"),
+                 helpText("Mixed models assume the random effects are normally ",
+                          "distributed. Points should hug the line."),
+                 plotOutput("ranef_qq", height = "420px")),
+
+        tabPanel("ANOVA",
+                 h4(textOutput("anova_title", inline = TRUE)),
+                 verbatimTextOutput("anova_table")),
+
+        tabPanel("Residuals",
+                 h4("Diagnostic plots"),
+                 plotOutput("resid_plot", height = "560px"),
+                 downloadButton("dl_resid", "Download PNG", class = "btn-default uf-dl"),
+                 htmlOutput("resid_help"),
+                 tags$hr(),
+                 h4("Influence by group (Cook's distance)"),
+                 uiOutput("infl_ui"),
+                 plotOutput("cook_plot", height = "380px"),
+                 htmlOutput("cook_help")),
+
+        tabPanel("EMMeans & post-hoc",
+                 h4("Estimated marginal means"),
+                 DT::dataTableOutput("emm_table"),
+                 downloadButton("dl_emm", "Download CSV", class = "btn-default uf-dl"),
+                 h4("Pairwise comparisons"),
+                 DT::dataTableOutput("pairs_table"),
+                 downloadButton("dl_pairs", "Download CSV", class = "btn-default uf-dl"),
+                 h4("Compact letter display (cld)"),
+                 DT::dataTableOutput("cld_table"),
+                 downloadButton("dl_cld", "Download CSV", class = "btn-default uf-dl"),
+                 helpText("Means sharing a letter are not significantly ",
+                          "different at the chosen adjustment level.")),
+
+        tabPanel("EMMeans plot",
+                 h4("Estimated means with letter groupings"),
+                 plotOutput("emm_plot", height = "520px"),
+                 downloadButton("dl_emmplot", "Download PNG", class = "btn-default uf-dl")),
+
+        tabPanel("Compare models",
+                 helpText("Use 'Save model for comparison' on a fitted model, ",
+                          "then change the spec, Run again, and compare here."),
+                 htmlOutput("compare_status"),
+                 h4("Likelihood-ratio test (saved vs current)"),
+                 verbatimTextOutput("compare_lrt"))
+      )
+    )
+  )
+)
+
+# ===========================================================================
+#  Server
+# ===========================================================================
+server <- function(input, output, session) {
+
+  rv <- reactiveValues(
+    reset    = 0,
+    fit      = NULL,
+    message  = NULL,
+    code     = NULL,
+    cook     = NULL,   # data.frame(group, cook) from influence.ME
+    cook_grp = NULL,
+    cook_err = NULL,
+    modelA   = NULL    # saved model for comparison
+  )
+
+  # -- Data ------------------------------------------------------------------
+  raw_data <- reactive({
+    if (input$data_source == "example") {
+      df <- as.data.frame(ChickWeight)
+    } else {
+      req(input$file)
+      df <- tryCatch(
+        read.csv(input$file$datapath, header = input$header,
+                 stringsAsFactors = FALSE),
+        error = function(e) NULL
+      )
+      validate(need(!is.null(df) && ncol(df) > 0,
+                    "Could not read that file as CSV."))
+    }
+    # Character -> factor; ordered factor -> plain factor (avoids poly contrasts)
+    df[] <- lapply(df, function(x) {
+      if (is.character(x)) factor(x)
+      else if (is.ordered(x)) factor(x, ordered = FALSE)
+      else x
+    })
+    df
+  })
+
+  # Apply optional user type overrides on top of the raw data
+  dataset <- reactive({
+    df <- raw_data(); req(df)
+    ff <- intersect(input$force_factor,  names(df))
+    fn <- intersect(input$force_numeric, names(df))
+    for (v in setdiff(ff, fn)) df[[v]] <- factor(df[[v]])
+    for (v in fn)
+      df[[v]] <- suppressWarnings(as.numeric(as.character(df[[v]])))
+    df
+  })
+
+  # Type-override selectors (built from raw column names, cleared on reset)
+  output$force_factor_ui <- renderUI({
+    df <- raw_data(); req(df); rv$reset
+    selectInput("force_factor", "Treat as factor (categorical)",
+                choices = names(df), multiple = TRUE)
+  })
+  output$force_numeric_ui <- renderUI({
+    df <- raw_data(); req(df); rv$reset
+    selectInput("force_numeric", "Treat as numeric (continuous)",
+                choices = names(df), multiple = TRUE)
+  })
+
+  # -- Data-preview outputs --------------------------------------------------
+  output$data_dims <- renderPrint({
+    df <- dataset(); req(df)
+    cat(sprintf("%d rows x %d columns\n", nrow(df), ncol(df)))
+  })
+  output$data_str <- renderPrint({ df <- dataset(); req(df); str(df) })
+  output$data_na <- DT::renderDataTable({
+    df <- dataset(); req(df)
+    na <- data.frame(Column = names(df),
+                     Missing = vapply(df, function(x) sum(is.na(x)), integer(1)),
+                     Class = vapply(df, function(x) class(x)[1], character(1)),
+                     row.names = NULL)
+    DT::datatable(na, options = list(dom = "t", pageLength = 50), rownames = FALSE)
+  })
+  output$data_head <- DT::renderDataTable({
+    df <- dataset(); req(df)
+    DT::datatable(head(df, 10), options = list(dom = "t", scrollX = TRUE),
+                  rownames = FALSE)
+  })
+
+  # -- Explore (raw data, pre-model) ----------------------------------------
+  output$explore_plot <- renderPlot({
+    df <- dataset(); req(df)
+    resp <- input$response; fx <- input$fixed
+    validate(need(!is.null(resp), "Select a response variable."),
+             need(length(fx) >= 1, "Select at least one fixed effect to explore."))
+    x <- fx[1]
+    cat_x <- is.factor(df[[x]]) || is.character(df[[x]])
+
+    p <- ggplot(df, aes(x = .data[[x]], y = .data[[resp]]))
+    if (cat_x) {
+      p <- p +
+        geom_boxplot(outlier.shape = NA, fill = UF_BLUE_LT, colour = UF_BLUE) +
+        geom_jitter(width = 0.15, height = 0, alpha = 0.45, colour = UF_ORANGE)
+    } else {
+      p <- p + geom_point(alpha = 0.55, colour = UF_BLUE) +
+        geom_smooth(method = "loess", formula = y ~ x, se = FALSE,
+                    colour = UF_ORANGE)
+    }
+    # facet by additional categorical fixed effects (2nd, and 3rd if present)
+    facet_vars <- character(0)
+    if (length(fx) >= 2 && (is.factor(df[[fx[2]]]) || is.character(df[[fx[2]]])))
+      facet_vars <- c(facet_vars, fx[2])
+    if (length(fx) >= 3 && (is.factor(df[[fx[3]]]) || is.character(df[[fx[3]]])))
+      facet_vars <- c(facet_vars, fx[3])
+    if (length(facet_vars) == 2)
+      p <- p + facet_grid(stats::reformulate(facet_vars[2], facet_vars[1]))
+    else if (length(facet_vars) == 1)
+      p <- p + facet_wrap(stats::reformulate(facet_vars))
+    p + labs(x = x, y = resp, title = sprintf("%s by %s", resp, x)) +
+      theme_minimal(base_size = 14) +
+      theme(plot.title = element_text(face = "bold", colour = UF_BLUE))
+  })
+
+  output$interaction_plot <- renderPlot({
+    df <- dataset(); req(df)
+    resp <- input$response; fx <- input$fixed
+    validate(need(!is.null(resp), "Select a response variable."),
+             need(length(fx) >= 2,
+                  "Select at least two fixed effects to see an interaction plot."))
+    x <- fx[1]; trace <- fx[2]
+    facet3 <- if (length(fx) >= 3) fx[3] else NULL
+
+    # Use only complete cases across the variables in play, and report drops
+    cols <- c(resp, x, trace, facet3)
+    cc   <- stats::complete.cases(df[cols])
+    n_drop <- sum(!cc)
+    df <- df[cc, , drop = FALSE]
+    validate(need(nrow(df) > 0, "No complete rows for the selected variables."))
+
+    grp_list <- list(X = factor(df[[x]]), G = factor(df[[trace]]))
+    if (!is.null(facet3)) grp_list$F3 <- factor(df[[facet3]])
+    ag <- aggregate(df[[resp]], by = grp_list,
+                    FUN = function(z) mean(z, na.rm = TRUE))
+    names(ag)[names(ag) == "x"] <- "mean"
+    n_lev <- nlevels(ag$G)
+    uf_pal <- rep(c(UF_BLUE, UF_ORANGE, "#5a7adf", "#ff8a5c"),
+                  length.out = max(n_lev, 1))
+    subt <- if (n_drop > 0)
+      sprintf("%d row(s) with missing values dropped", n_drop) else NULL
+    p <- ggplot(ag, aes(x = X, y = mean, colour = G, group = G)) +
+      geom_line(linewidth = 1) + geom_point(size = 2.6) +
+      scale_colour_manual(values = uf_pal)
+    if (!is.null(facet3)) p <- p + facet_wrap(~ F3)
+    p + labs(x = x, colour = trace, y = sprintf("mean %s", resp),
+             subtitle = subt,
+             title = sprintf("%s: %s \u00d7 %s (raw means)", resp, x, trace)) +
+      theme_minimal(base_size = 14) +
+      theme(plot.title = element_text(face = "bold", colour = UF_BLUE),
+            legend.title = element_text(colour = UF_CHARCOAL))
+  })
+
+  # -- Dynamic variable selectors -------------------------------------------
+  output$response_ui <- renderUI({
+    df <- dataset(); req(df); rv$reset
+    num_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+    validate(need(length(num_cols) > 0,
+                  "No numeric columns available for a response variable."))
+    selectInput("response", "Response variable (numeric)", choices = num_cols)
+  })
+
+  output$fixed_ui <- renderUI({
+    df <- dataset(); req(df); rv$reset
+    selectizeInput("fixed",
+                   sprintf("Fixed effects  (choose up to %d)", MAX_FIXED),
+                   choices = names(df), multiple = TRUE,
+                   options = list(maxItems = MAX_FIXED,
+                                  placeholder = "select 1-3 variables"))
+  })
+
+  output$random_ui <- renderUI({
+    df <- dataset(); req(df); rv$reset
+    selectInput("random", "Random effects  (grouping factors)",
+                choices = names(df), multiple = TRUE)
+  })
+
+  # Optional random slope (one of the chosen fixed effects)
+  output$slope_ui <- renderUI({
+    df <- dataset(); req(df)
+    fx <- input$fixed
+    selectInput("ranslope",
+                "Random slope variable (optional; applied to each group)",
+                choices = c("(intercept only)" = "", fx),
+                selected = "")
+  })
+
+  # EMMeans only over categorical fixed effects
+  output$emm_ui <- renderUI({
+    df <- dataset(); req(df)
+    fx <- input$fixed
+    cat_fixed <- if (length(fx)) fx[is_categorical(df, fx)] else character(0)
+    selectInput("emmvars",
+                "EMMeans over (categorical fixed effects only)",
+                choices = cat_fixed, multiple = TRUE)
+  })
+
+  # -- Reset -----------------------------------------------------------------
+  observeEvent(input$reset, {
+    rv$reset    <- rv$reset + 1
+    rv$fit      <- NULL
+    rv$message  <- NULL
+    rv$code     <- NULL
+    rv$cook     <- NULL
+    rv$cook_err <- NULL
+    # rv$modelA is intentionally preserved so a saved baseline survives a reset
+    updateSelectInput(session, "transform", selected = "none")
+    updateSelectInput(session, "adjust",    selected = "tukey")
+    updateSelectInput(session, "ddf",       selected = DDF_DEFAULT)
+    updateRadioButtons(session, "estimator", selected = "reml")
+    updateCheckboxInput(session, "interactions",  value = FALSE)
+    updateCheckboxInput(session, "backtransform", value = TRUE)
+    updateSliderInput(session, "conf", value = 0.95)
+  })
+
+  # -- Fit the model on demand ----------------------------------------------
+  observeEvent(input$run, {
+    df <- dataset(); req(df)
+
+    response  <- input$response
+    transform <- input$transform
+    fixed     <- input$fixed
+    random    <- input$random
+    slope     <- input$ranslope
+
+    # --- Validation: keep lmer from erroring --------------------------------
+    problems <- character(0)
+    if (is.null(fixed) || length(fixed) == 0)
+      problems <- c(problems,
+                    "No fixed effects selected. A model needs at least one fixed effect for the ANOVA and EMMeans to be meaningful.")
+    if (length(fixed) > MAX_FIXED)
+      problems <- c(problems,
+                    sprintf("More than %d fixed effects selected. This tool limits comparisons to %d.", MAX_FIXED, MAX_FIXED))
+    if (is.null(random) || length(random) == 0)
+      problems <- c(problems,
+                    "No random effects selected. lmer() requires at least one random (grouping) effect \u2014 without one use a fixed-effects model such as lm() / aov().")
+
+    if (length(problems)) {
+      rv$message <- list(type = "warning", text = problems); rv$fit <- NULL; rv$code <- NULL
+      return()
+    }
+
+    # --- Transformation sanity checks ---------------------------------------
+    y <- df[[response]]
+    bad <- switch(transform,
+                  "log"     = if (any(y <= 0, na.rm = TRUE)) "log() requires all response values > 0.",
+                  "log1p"   = if (any(y <= -1, na.rm = TRUE)) "log1p() requires all response values > -1 (\u2212 1 gives log(0) = \u2212Inf).",
+                  "sqrt"    = if (any(y < 0,  na.rm = TRUE)) "sqrt() requires all response values >= 0.",
+                  "inverse" = if (any(y == 0, na.rm = TRUE)) "inverse (1/y) requires all response values != 0.",
+                  "asin"    = if (any(y < 0 | y > 1, na.rm = TRUE)) "arcsine-sqrt requires the response to be a proportion in [0, 1].",
+                  NULL)
+    if (!is.null(bad)) {
+      rv$message <- list(type = "error", text = bad); rv$fit <- NULL; rv$code <- NULL; return()
+    }
+
+    # --- Coerce random-effect grouping variables to factors -----------------
+    model_df <- df
+    for (g in random) model_df[[g]] <- factor(model_df[[g]])
+
+    # --- Degenerate-factor guards (clearer than lmer's raw errors) ----------
+    n_levels_used <- function(v) nlevels(droplevels(factor(v[!is.na(v)])))
+    deg <- character(0)
+    cat_fixed <- fixed[is_categorical(df, fixed)]
+    for (v in cat_fixed)
+      if (n_levels_used(df[[v]]) < 2)
+        deg <- c(deg, sprintf(
+          "Fixed effect '%s' has only one level present \u2014 it can't be estimated. Drop it or pick another variable.", v))
+    for (g in random)
+      if (n_levels_used(model_df[[g]]) < 2)
+        deg <- c(deg, sprintf(
+          "Random effect '%s' has only one level \u2014 lmer() needs each grouping factor to have >1 level. A single-group factor carries no between-group variance.", g))
+    if (length(deg)) {
+      rv$message <- list(type = "warning", text = deg)
+      rv$fit <- NULL; rv$code <- NULL; return()
+    }
+
+    # --- Build & fit --------------------------------------------------------
+    use_slope <- if (!is.null(slope) && nzchar(slope)) slope else NULL
+    fml_str <- build_formula_string(response, transform, fixed, random,
+                                    input$interactions, use_slope)
+    fml     <- stats::as.formula(fml_str)
+    use_reml <- input$estimator == "reml"
+
+    fit <- tryCatch(
+      lmerTest::lmer(fml, data = model_df, REML = use_reml),
+      error = function(e) e
+    )
+    if (inherits(fit, "error")) {
+      rv$message <- list(type = "error",
+                         text = paste("Model failed to fit:", conditionMessage(fit)))
+      rv$fit <- NULL; rv$code <- NULL; return()
+    }
+
+    # --- Soft diagnostics (singular / convergence) --------------------------
+    notes <- character(0)
+    if (isTRUE(lme4::isSingular(fit)))
+      notes <- c(notes,
+                 "Singular fit: the random-effects structure may be too complex for the data (e.g. drop the random slope).")
+    conv_msg <- fit@optinfo$conv$lme4$messages
+    if (!is.null(conv_msg)) notes <- c(notes, paste("Convergence note:", conv_msg))
+    rv$message <- if (length(notes)) list(type = "info", text = notes) else NULL
+
+    rv$fit <- list(mod = fit, fml = fml, fml_str = fml_str,
+                   response = response, transform = transform,
+                   fixed = fixed, random = random, slope = use_slope,
+                   reml = use_reml, ddf = input$ddf, data = model_df)
+    rv$cook <- NULL; rv$cook_err <- NULL   # influence belongs to a specific fit
+
+    # --- Generated, copy-pasteable R code -----------------------------------
+    emmvars <- input$emmvars
+    spec_str <- if (length(emmvars))
+      paste("~", paste(bq(emmvars), collapse = " * ")) else "~ <pick a factor>"
+    bt        <- transform != "none" && isTRUE(input$backtransform)
+    tran_spec <- tran_for_emmeans(transform)
+    emm_call  <- if (bt && !is.null(tran_spec))
+      sprintf('emm <- emmeans(ref_grid(mod, tran = "%s"), %s,\n               type = "response", level = %s)',
+              tran_spec, spec_str, format(input$conf))
+    else
+      sprintf('emm <- emmeans(mod, %s, type = "%s", level = %s)',
+              spec_str, if (bt) "response" else "link", format(input$conf))
+
+    rv$code <- paste(
+      "library(lmerTest)   # loads lme4, adds K-R / Satterthwaite ddf",
+      "library(emmeans)",
+      "library(multcomp)",
+      "",
+      "# --- Fit the mixed model -------------------------------------------",
+      sprintf("mod <- lmer(%s,\n            data = dat, REML = %s)", fml_str,
+              if (use_reml) "TRUE" else "FALSE"),
+      "summary(mod)",
+      "",
+      "# --- ANOVA -----------------------------------------------------------",
+      sprintf('anova(mod, ddf = "%s")', input$ddf),
+      "",
+      "# --- Fit quality -----------------------------------------------------",
+      "performance::r2(mod)    # marginal & conditional R^2",
+      "performance::icc(mod)   # intraclass correlation",
+      "",
+      "# --- Estimated marginal means + post hoc -----------------------------",
+      emm_call,
+      sprintf('pairs(emm, adjust = "%s")', input$adjust),
+      sprintf('cld(emm, Letters = letters, adjust = "%s", reversed = TRUE)',
+              input$adjust),
+      sep = "\n"
+    )
+
+    updateTabsetPanel(session, "tabs", selected = "ANOVA")
+  })
+
+  # -- Message box -----------------------------------------------------------
+  output$message_box <- renderUI({
+    m <- rv$message; if (is.null(m)) return(NULL)
+    cls <- switch(m$type, error = "alert alert-danger",
+                  info = "alert alert-info", "alert alert-warning")
+    lbl <- switch(m$type, error = "Error: ", info = "Note: ", "Heads up: ")
+    div(class = cls, tags$b(lbl), tags$ul(lapply(m$text, tags$li)))
+  })
+
+  # -- Model & code outputs --------------------------------------------------
+  output$code_block <- renderText({ req(rv$code); rv$code })
+  output$model_summary <- renderPrint({ req(rv$fit); summary(rv$fit$mod) })
+  output$dl_code <- downloadHandler(
+    filename = function() "mixed_model_code.R",
+    content  = function(file) writeLines(rv$code %||% "# run an analysis first", file)
+  )
+
+  # -- Fit statistics & variance components ----------------------------------
+  output$fit_table <- DT::renderDataTable({
+    req(rv$fit); mod <- rv$fit$mod
+    n_total <- nrow(rv$fit$data)
+    n_used  <- stats::nobs(mod)
+    stats <- list(
+      AIC = AIC(mod), BIC = BIC(mod),
+      logLik = as.numeric(logLik(mod)), deviance = deviance(mod),
+      n_obs_used = n_used, n_obs_total = n_total,
+      n_dropped_NA = n_total - n_used)
+    r2 <- NULL
+    if (HAS_PERFORMANCE) {
+      r2 <- tryCatch(performance::r2(mod), error = function(e) NULL)
+      icc <- tryCatch(performance::icc(mod), error = function(e) NULL)
+      if (!is.null(r2)) {
+        stats$R2_marginal    <- as.numeric(r2$R2_marginal)
+        stats$R2_conditional <- as.numeric(r2$R2_conditional)
+      }
+      if (!is.null(icc)) stats$ICC <- as.numeric(icc$ICC_adjusted)
+    } else if (HAS_MUMIN) {
+      r2m <- tryCatch(MuMIn::r.squaredGLMM(mod), error = function(e) NULL)
+      if (!is.null(r2m)) {
+        stats$R2_marginal    <- as.numeric(r2m[1, "R2m"])
+        stats$R2_conditional <- as.numeric(r2m[1, "R2c"])
+      }
+    }
+    tab <- data.frame(Statistic = names(stats),
+                      Value = round(unlist(stats), 4), row.names = NULL)
+    DT::datatable(tab, options = list(dom = "t", pageLength = 25), rownames = FALSE)
+  })
+
+  output$fit_help <- renderUI({
+    req(rv$fit)
+    extra <- if (!HAS_PERFORMANCE && !HAS_MUMIN)
+      "<br><i>Install the 'performance' package to see marginal/conditional R&sup2; and ICC.</i>" else ""
+    HTML(paste0(
+      "<div style='margin-top:6px'><b>Marginal R&sup2;</b> = variance explained by fixed effects; ",
+      "<b>conditional R&sup2;</b> = variance explained by fixed + random effects. ",
+      "<b>ICC</b> is the share of variance attributable to the grouping factor(s). ",
+      "Lower AIC/BIC indicate better relative fit.", extra, "</div>"))
+  })
+
+  output$vc_table <- DT::renderDataTable({
+    req(rv$fit)
+    vc <- as.data.frame(lme4::VarCorr(rv$fit$mod))
+    DT::datatable(round_df(vc), options = list(dom = "t"), rownames = FALSE)
+  })
+
+  output$ranef_plot <- renderPlot({
+    req(rv$fit)
+    re <- lme4::ranef(rv$fit$mod, condVar = TRUE)
+    lattice::dotplot(re, strip = TRUE,
+                     scales = list(x = list(relation = "free")))[[1]]
+  })
+
+  output$ranef_qq <- renderPlot({
+    req(rv$fit)
+    re <- lme4::ranef(rv$fit$mod)
+    # tidy each grouping factor x term into one long data frame
+    dfl <- do.call(rbind, lapply(names(re), function(g) {
+      d <- re[[g]]
+      do.call(rbind, lapply(names(d), function(term)
+        data.frame(panel = paste0(g, ": ", term), value = d[[term]])))
+    }))
+    validate(need(nrow(dfl) > 1,
+                  "Not enough random-effect estimates to assess normality."))
+    ggplot(dfl, aes(sample = value)) +
+      stat_qq(colour = UF_BLUE) + stat_qq_line(colour = UF_ORANGE, linewidth = 1) +
+      facet_wrap(~ panel, scales = "free") +
+      labs(x = "Theoretical quantiles", y = "BLUP",
+           title = "Normal Q-Q of random effects") +
+      theme_minimal(base_size = 13) +
+      theme(plot.title = element_text(face = "bold", colour = UF_BLUE))
+  })
+
+  # -- ANOVA -----------------------------------------------------------------
+  output$anova_title <- renderText({
+    req(rv$fit); sprintf("Type III ANOVA (ddf = %s)", rv$fit$ddf)
+  })
+  output$anova_table <- renderPrint({
+    req(rv$fit)
+    a <- tryCatch(anova(rv$fit$mod, ddf = rv$fit$ddf), error = function(e) e)
+    if (inherits(a, "error")) {
+      cat("Requested ddf failed (", conditionMessage(a),
+          ").\nFalling back to Satterthwaite:\n\n", sep = "")
+      print(anova(rv$fit$mod, ddf = "Satterthwaite"))
+    } else print(a)
+  })
+
+  # -- Residual diagnostics --------------------------------------------------
+  output$resid_plot <- renderPlot({ req(rv$fit); draw_resid_plots(rv$fit$mod) })
+  output$dl_resid <- downloadHandler(
+    filename = function() "residual_diagnostics.png",
+    content  = function(file) {
+      png(file, width = 1100, height = 900, res = 120)
+      draw_resid_plots(rv$fit$mod); dev.off()
+    }
+  )
+  output$resid_help <- renderUI({
+    req(rv$fit)
+    HTML(paste0(
+      "<div style='margin-top:10px'><b>How to read these:</b><ul>",
+      "<li><b>Residuals vs Fitted</b> should be a shapeless cloud centred on 0. ",
+      "A funnel shape suggests non-constant variance (try a log/sqrt transform); ",
+      "a curved orange line suggests a missing term or nonlinearity.</li>",
+      "<li><b>Normal Q-Q</b> points should hug the orange line. Heavy tails or an ",
+      "S-shape indicate non-normal residuals.</li>",
+      "<li><b>Scale-Location</b> should show a roughly flat orange line; an upward ",
+      "trend again points to increasing variance with the mean.</li>",
+      "<li><b>Histogram</b> should look roughly symmetric and bell-shaped.</li>",
+      "</ul>For mixed models these check the residuals only; gross departures are ",
+      "what matter for a quick review, not tiny wiggles.</div>"))
+  })
+
+  # -- Influence: leave-one-group-out Cook's distance (on demand) ------------
+  output$infl_ui <- renderUI({
+    req(rv$fit)
+    if (!HAS_INFLUENCEME)
+      return(div(class = "alert alert-info",
+                 "Install the 'influence.ME' package to enable ",
+                 "leave-one-group-out Cook's distance."))
+    tagList(
+      selectInput("infl_group", "Grouping factor to assess",
+                  choices = rv$fit$random),
+      actionButton("run_infl", "Compute influence (can be slow)",
+                   class = "btn-default"),
+      helpText("Refits the model dropping each level of the chosen factor ",
+               "in turn \u2014 this can take a while on large data.")
+    )
+  })
+
+  observeEvent(input$run_infl, {
+    req(rv$fit, HAS_INFLUENCEME, input$infl_group)
+    withProgress(message = "Refitting (leave-one-group-out)...", value = 0.5, {
+      infl <- tryCatch(
+        influence.ME::influence(rv$fit$mod, group = input$infl_group),
+        error = function(e) e)
+    })
+    if (inherits(infl, "error")) {
+      rv$cook <- NULL; rv$cook_err <- conditionMessage(infl); return()
+    }
+    cd <- tryCatch(cooks.distance(infl), error = function(e) e)
+    if (inherits(cd, "error")) {
+      rv$cook <- NULL; rv$cook_err <- conditionMessage(cd); return()
+    }
+    grp <- if (!is.null(rownames(cd))) rownames(cd) else as.character(seq_along(cd))
+    rv$cook     <- data.frame(group = grp, cook = as.numeric(cd))
+    rv$cook_grp <- input$infl_group
+    rv$cook_err <- NULL
+  })
+
+  output$cook_plot <- renderPlot({
+    req(rv$fit)
+    validate(need(is.null(rv$cook_err), paste("Influence failed:", rv$cook_err)))
+    d <- rv$cook
+    validate(need(!is.null(d), "Click 'Compute influence' to estimate Cook's distance."))
+    cutoff <- 4 / nrow(d)
+    ggplot(d, aes(x = stats::reorder(group, cook), y = cook)) +
+      geom_col(fill = UF_BLUE) +
+      geom_hline(yintercept = cutoff, linetype = 2, colour = UF_ORANGE,
+                 linewidth = 1) +
+      coord_flip() +
+      labs(x = rv$cook_grp, y = "Cook's distance",
+           title = sprintf("Group influence (cutoff 4/n = %.3f)", cutoff)) +
+      theme_minimal(base_size = 13) +
+      theme(plot.title = element_text(face = "bold", colour = UF_BLUE))
+  })
+
+  output$cook_help <- renderUI({
+    req(rv$cook)
+    HTML(paste0(
+      "<div style='margin-top:6px'>Bars past the dashed line exceed the common ",
+      "4/n rule of thumb and may be unduly influencing the fit. Inspect those ",
+      "groups; the rule is a flag for a closer look, not an automatic ",
+      "delete.</div>"))
+  })
+
+  # -- EMMeans computation (live; toggle back-transform / level) -------------
+  emm_result <- reactive({
+    req(rv$fit)
+    emmvars <- input$emmvars
+    validate(need(length(emmvars) >= 1,
+                  "Select one or more categorical fixed effects for EMMeans."))
+    mod <- rv$fit$mod
+    if (!all(emmvars %in% rv$fit$fixed))
+      validate(need(FALSE,
+                    "Your EMMeans selection no longer matches the fitted model. Click 'Run analysis' again."))
+
+    spec <- stats::as.formula(paste("~", paste(bq(emmvars), collapse = " * ")))
+    bt   <- rv$fit$transform != "none" && isTRUE(input$backtransform)
+    type <- if (bt) "response" else "link"
+
+    # emmeans auto-detects log / sqrt, but NOT inverse / arcsine / log1p.
+    # Set the transformation explicitly so back-transformation is correct
+    # (and the "(back-transformed)" label is never a lie).
+    tran_spec <- tran_for_emmeans(rv$fit$transform)
+
+    emm <- tryCatch({
+      if (bt && !is.null(tran_spec)) {
+        rg <- emmeans::ref_grid(mod, tran = tran_spec)
+        emmeans::emmeans(rg, spec, type = "response", level = input$conf)
+      } else {
+        emmeans::emmeans(mod, spec, type = type, level = input$conf)
+      }
+    }, error = function(e) e)
+    validate(need(!inherits(emm, "error"),
+                  paste("EMMeans failed:", if (inherits(emm, "error")) conditionMessage(emm) else "")))
+
+    cld_df <- tryCatch(
+      as.data.frame(multcomp::cld(emm, Letters = letters,
+                                  adjust = input$adjust, reversed = TRUE)),
+      error = function(e) e)
+    validate(need(!inherits(cld_df, "error"),
+                  "Could not compute letter groupings for this specification."))
+    if (".group" %in% names(cld_df)) cld_df$.group <- trimws(cld_df$.group)
+
+    list(emm = emm, vars = emmvars, cld = cld_df,
+         pairs = as.data.frame(pairs(emm, adjust = input$adjust)),
+         backtransformed = bt)
+  })
+
+  output$emm_table <- DT::renderDataTable({
+    DT::datatable(round_df(as.data.frame(emm_result()$emm)),
+                  options = list(dom = "t", pageLength = 25), rownames = FALSE)
+  })
+  output$pairs_table <- DT::renderDataTable({
+    DT::datatable(round_df(emm_result()$pairs),
+                  options = list(dom = "tp", pageLength = 15), rownames = FALSE)
+  })
+  output$cld_table <- DT::renderDataTable({
+    DT::datatable(round_df(emm_result()$cld),
+                  options = list(dom = "t", pageLength = 25), rownames = FALSE)
+  })
+  output$dl_emm <- downloadHandler(
+    filename = function() "emmeans.csv",
+    content  = function(f) write.csv(as.data.frame(emm_result()$emm), f, row.names = FALSE))
+  output$dl_pairs <- downloadHandler(
+    filename = function() "pairwise_comparisons.csv",
+    content  = function(f) write.csv(emm_result()$pairs, f, row.names = FALSE))
+  output$dl_cld <- downloadHandler(
+    filename = function() "cld_letters.csv",
+    content  = function(f) write.csv(emm_result()$cld, f, row.names = FALSE))
+
+  # -- EMMeans plot with letter groupings ------------------------------------
+  build_emm_plot <- function() {
+    er <- emm_result()
+    cldf <- er$cld; vars <- er$vars
+    valcol <- if ("response" %in% names(cldf)) "response" else "emmean"
+    lcol <- intersect(c("lower.CL", "asymp.LCL", "LCL"), names(cldf))[1]
+    ucol <- intersect(c("upper.CL", "asymp.UCL", "UCL"), names(cldf))[1]
+    grpcol <- if (".group" %in% names(cldf)) ".group" else NA
+
+    ylab <- if (er$backtransformed)
+      sprintf("%s (back-transformed)", rv$fit$response) else
+        build_lhs(rv$fit$response, rv$fit$transform)
+
+    cldf[[vars[1]]] <- factor(cldf[[vars[1]]])
+    if (length(vars) >= 3) cldf[[vars[3]]] <- factor(cldf[[vars[3]]])
+
+    if (length(vars) == 1) {
+      p <- ggplot(cldf, aes(x = .data[[vars[1]]], y = .data[[valcol]])) +
+        geom_point(size = 3, colour = UF_BLUE)
+      if (!is.na(lcol) && !is.na(ucol))
+        p <- p + geom_errorbar(aes(ymin = .data[[lcol]], ymax = .data[[ucol]]),
+                               width = 0.15, colour = UF_BLUE)
+      if (!is.na(grpcol)) {
+        ytext <- if (!is.na(ucol)) cldf[[ucol]] else cldf[[valcol]]
+        p <- p + geom_text(aes(label = .data[[grpcol]], y = ytext),
+                           vjust = -0.8, fontface = "bold")
+      }
+    } else {
+      cldf[[vars[2]]] <- factor(cldf[[vars[2]]])
+      dodge <- position_dodge(width = 0.6)
+      p <- ggplot(cldf, aes(x = .data[[vars[1]]], y = .data[[valcol]],
+                            colour = .data[[vars[2]]], group = .data[[vars[2]]])) +
+        geom_point(size = 3, position = dodge)
+      if (!is.na(lcol) && !is.na(ucol))
+        p <- p + geom_errorbar(aes(ymin = .data[[lcol]], ymax = .data[[ucol]]),
+                               width = 0.2, position = dodge)
+      if (!is.na(grpcol)) {
+        ytext <- if (!is.na(ucol)) cldf[[ucol]] else cldf[[valcol]]
+        p <- p + geom_text(aes(label = .data[[grpcol]], y = ytext),
+                           vjust = -0.8, position = dodge,
+                           fontface = "bold", show.legend = FALSE)
+      }
+      n_lev <- nlevels(cldf[[vars[2]]])
+      uf_pal <- rep(c(UF_BLUE, UF_ORANGE, "#5a7adf", "#ff8a5c"),
+                    length.out = max(n_lev, 1))
+      p <- p + scale_colour_manual(values = uf_pal)
+    }
+
+    # third fixed effect -> facets
+    if (length(vars) >= 3)
+      p <- p + facet_wrap(stats::reformulate(vars[3]))
+
+    p + labs(y = ylab, x = vars[1],
+             title = "Estimated marginal means \u00b1 CI with letter groupings") +
+      theme_minimal(base_size = 14) +
+      theme(plot.title = element_text(face = "bold", colour = UF_BLUE),
+            axis.title = element_text(colour = UF_CHARCOAL),
+            legend.title = element_text(colour = UF_CHARCOAL))
+  }
+
+  output$emm_plot <- renderPlot({ print(build_emm_plot()) })
+  output$dl_emmplot <- downloadHandler(
+    filename = function() "emmeans_plot.png",
+    content  = function(file) ggsave(file, build_emm_plot(), width = 9, height = 6, dpi = 150)
+  )
+
+  # -- Model comparison ------------------------------------------------------
+  observeEvent(input$save_model, {
+    if (is.null(rv$fit)) {
+      rv$message <- list(type = "warning",
+                         text = "Run a model first, then save it as the comparison baseline.")
+      return()
+    }
+    rv$modelA <- rv$fit
+  })
+
+  output$compare_status <- renderUI({
+    a <- rv$modelA; b <- rv$fit
+    if (is.null(a))
+      return(div(class = "alert alert-info",
+                 "No saved model yet. Fit a model and click ",
+                 tags$b("Save model for comparison"), "."))
+    cur <- if (is.null(b)) "(none \u2014 run a model)" else b$fml_str
+    HTML(paste0(
+      "<div style='margin-bottom:8px'>",
+      "<b>Saved (A):</b> <code>", a$fml_str, "</code><br>",
+      "<b>Current (B):</b> <code>", cur, "</code></div>"))
+  })
+
+  output$compare_lrt <- renderPrint({
+    a <- rv$modelA; b <- rv$fit
+    if (is.null(a) || is.null(b)) {
+      cat("Need a saved model (A) and a current fitted model (B).\n"); return()
+    }
+    if (!identical(a$response, b$response) || !identical(a$transform, b$transform))
+      cat("WARNING: the two models use a different response or transformation,",
+          "so a likelihood-ratio test is not valid. Compare AIC/BIC only, and",
+          "with caution.\n\n")
+    if (nrow(a$data) != nrow(b$data))
+      cat("WARNING: the two models were fit on a different number of rows.",
+          "A valid LRT requires the same data.\n\n")
+    cat("Note: anova() refits REML models with ML for the test; the LRT is",
+        "valid only for nested models.\n\n")
+    res <- tryCatch(stats::anova(a$mod, b$mod), error = function(e) e)
+    if (inherits(res, "error"))
+      cat("Comparison failed:", conditionMessage(res)) else print(res)
+  })
+}
+
+shinyApp(ui, server)
