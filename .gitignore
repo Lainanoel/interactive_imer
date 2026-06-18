@@ -1,0 +1,35 @@
+# ---- R ----
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+*.Rproj
+*-Ex.R
+.Renviron
+
+# renv (if used)
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/staging/
+
+# ---- Shiny / app artifacts ----
+rsconnect/
+shiny-bookmarks/
+
+# ---- Output files the app can generate ----
+*.png
+*.csv
+*.pdf
+!docs/*.png          # keep screenshots you commit on purpose
+
+# ---- OS / editor cruft ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*~
+*.swp
