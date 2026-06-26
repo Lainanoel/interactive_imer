@@ -217,6 +217,79 @@ draw_resid_plots <- function(mod) {
        xlab = "Residuals", main = "Histogram of residuals")
 }
 
+# ---------------------------------------------------------------------------
+#  Built-in example: a 3-factor randomized complete block design (RCBD)
+# ---------------------------------------------------------------------------
+#  A sensible, fully crossed design so every feature has something to show:
+#    * Block (1-6)        : the random / grouping factor
+#    * Variety (V1-V3)    : categorical treatment factor (read as text)
+#    * Nitrogen (0/100/200): a treatment factor stored as a NUMBER -- it must be
+#                            treated as a factor to compare its levels in EMMeans
+#                            (use 'Variable types' in the sidebar)
+#    * Irrigation         : categorical treatment factor (read as text)
+#  Five responses, each chosen to exercise a different part of the app:
+#    yield_kg   - real Variety x Nitrogen interaction (no transform)
+#    height_cm  - additive main effects only
+#    biomass_g  - right-skewed / multiplicative (log transform)
+#    germination- a proportion in (0,1)        (arcsine-sqrt transform)
+#    pest_count - counts                        (sqrt transform)
+make_example_data <- function() {
+  set.seed(2024)
+  blocks <- 1:6
+  d <- expand.grid(Block      = blocks,
+                   Variety     = c("V1", "V2", "V3"),
+                   Nitrogen    = c(0, 100, 200),
+                   Irrigation  = c("Drip", "Flood"),
+                   KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+  # randomize plot order within each block (the "randomized" part of RCBD)
+  d <- d[order(d$Block, sample(nrow(d))), ]
+  d$PlotOrder <- ave(d$Block, d$Block, FUN = seq_along)
+  rownames(d) <- NULL
+  n <- nrow(d)
+  
+  bz   <- stats::setNames(rnorm(length(blocks)), as.character(blocks))
+  b    <- unname(bz[as.character(d$Block)])
+  varV <- unname(c(V1 = 0, V2 = 8, V3 = 4)[d$Variety])
+  nitr <- unname(c(`0` = 0, `100` = 6, `200` = 8)[as.character(d$Nitrogen)])
+  irr  <- unname(c(Drip = 0, Flood = -3)[d$Irrigation])
+  
+  # yield: Variety x Nitrogen interaction (V2 gains most at high N)
+  inter <- ifelse(d$Variety == "V2" & d$Nitrogen == 200,  7,
+                  ifelse(d$Variety == "V3" & d$Nitrogen == 200, -3, 0))
+  d$yield_kg <- round(50 + varV + nitr + irr + inter + 5 * b +
+                        rnorm(n, 0, 2.5), 2)
+  
+  # height: purely additive main effects
+  varH <- unname(c(V1 = 0, V2 = 10, V3 = -5)[d$Variety])
+  nitH <- unname(c(`0` = 0, `100` = 5, `200` = 9)[as.character(d$Nitrogen)])
+  irrH <- unname(c(Drip = 0, Flood = 4)[d$Irrigation])
+  d$height_cm <- round(120 + varH + nitH + irrH + 4 * b + rnorm(n, 0, 3), 1)
+  
+  # biomass: multiplicative / right-skewed -> log transform
+  log_mu <- 3.0 +
+    unname(c(V1 = 0, V2 = 0.30, V3 = 0.15)[d$Variety]) +
+    unname(c(`0` = 0, `100` = 0.18, `200` = 0.25)[as.character(d$Nitrogen)]) +
+    unname(c(Drip = 0, Flood = -0.12)[d$Irrigation]) + 0.20 * b
+  d$biomass_g <- round(exp(log_mu + rnorm(n, 0, 0.18)), 1)
+  
+  # germination: a proportion in (0, 1) -> arcsine-sqrt transform
+  linp <- 1.2 +
+    unname(c(V1 = 0, V2 = 0.4, V3 = 0.1)[d$Variety]) +
+    unname(c(`0` = 0, `100` = 0.35, `200` = 0.6)[as.character(d$Nitrogen)]) +
+    unname(c(Drip = 0, Flood = -0.5)[d$Irrigation]) + 0.3 * b +
+    rnorm(n, 0, 0.30)
+  d$germination <- round(stats::plogis(linp), 3)
+  
+  # pest_count: counts -> sqrt transform
+  lam <- exp(1.0 +
+               unname(c(Drip = 0, Flood = 0.5)[d$Irrigation]) +
+               unname(c(V1 = 0, V2 = 0.1, V3 = 0.25)[d$Variety]) + 0.15 * b)
+  d$pest_count <- rpois(n, lam)
+  
+  d[, c("Block", "Variety", "Nitrogen", "Irrigation", "PlotOrder",
+        "yield_kg", "height_cm", "biomass_g", "germination", "pest_count")]
+}
+
 # A collapsible, copy-able code block tied to a renderText output ------------
 code_panel <- function(out_id, label = "R code") {
   tags$details(class = "uf-codewrap",
@@ -314,7 +387,7 @@ ui <- fluidPage(
       div(id = "controls",
           
           radioButtons("data_source", "Data source",
-                       choices = c("Example data (ChickWeight)" = "example",
+                       choices = c("Example data (3-factor RCBD)" = "example",
                                    "Upload a CSV file"          = "upload"),
                        selected = "example"),
           
@@ -324,12 +397,15 @@ ui <- fluidPage(
             checkboxInput("header", "Header row", TRUE)
           ),
           
-          tags$details(
-            tags$summary(tags$b("\u25b8 Variable types (optional)")),
-            helpText("Override how columns are read \u2014 e.g. an ID stored ",
-                     "as a number, or a treatment code read as text."),
-            uiOutput("force_factor_ui"),
-            uiOutput("force_numeric_ui")
+          tags$details(open = NA,
+                       tags$summary(tags$b("\u25be Variable types \u2014 treat numbers as categories")),
+                       helpText("If a treatment level or ID is stored as a number (e.g. ",
+                                "Nitrogen 0/100/200, or Block 1\u20136), read it as a factor ",
+                                "so its levels can be compared in the ANOVA and EMMeans. ",
+                                "Otherwise a numeric column is fitted as a continuous slope, ",
+                                "not as separate groups."),
+                       uiOutput("force_factor_ui"),
+                       uiOutput("force_numeric_ui")
           ),
           
           tags$details(open = NA,
@@ -565,7 +641,7 @@ server <- function(input, output, session) {
   # -- Data ------------------------------------------------------------------
   raw_data <- reactive({
     if (input$data_source == "example") {
-      df <- as.data.frame(ChickWeight)
+      df <- make_example_data()
     } else {
       req(input$file)
       df <- tryCatch(
@@ -607,8 +683,20 @@ server <- function(input, output, session) {
   # Type-override selectors (built from raw column names, cleared on reset)
   output$force_factor_ui <- renderUI({
     df <- raw_data(); req(df); rv$reset
-    selectInput("force_factor", "Treat as factor (categorical)",
-                choices = names(df), multiple = TRUE)
+    # Flag numeric columns that look categorical (few distinct values), so the
+    # user knows which ones probably need to be treated as factors.
+    num_cols  <- names(df)[vapply(df, is.numeric, logical(1))]
+    looks_cat <- num_cols[vapply(num_cols, function(v)
+      length(unique(stats::na.omit(df[[v]]))) <= 10, logical(1))]
+    hint <- if (length(looks_cat))
+      helpText(HTML(sprintf(
+        "These numeric column(s) look categorical \u2014 consider treating them as factors: <b>%s</b>.",
+        paste(looks_cat, collapse = ", ")))) else NULL
+    tagList(
+      selectInput("force_factor", "Treat as factor (categorical)",
+                  choices = names(df), multiple = TRUE),
+      hint
+    )
   })
   output$force_numeric_ui <- renderUI({
     df <- raw_data(); req(df); rv$reset
