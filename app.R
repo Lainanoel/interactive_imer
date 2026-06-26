@@ -24,17 +24,22 @@
 #      warning instead of a crash
 #
 #  Install once:
-#    install.packages(c("shiny","shinyjs","lmerTest","emmeans","pbkrtest",
-#                       "multcomp","multcompView","ggplot2","DT","lattice",
-#                       "performance","influence.ME"))
+#    install.packages(c("shiny","shinyjs","bslib","lmerTest","emmeans",
+#                       "pbkrtest","multcomp","multcompView","ggplot2","DT",
+#                       "lattice","performance","influence.ME"))
 #    # 'performance' (R2/ICC) and 'influence.ME' (Cook's distance) are optional;
 #    # the app degrades gracefully if they are missing.
+#  Branding:
+#    The shared UF/IFAS theme lives in components.R. Keep that file beside
+#    app.R so the look matches the rest of the kit; if it's absent the app
+#    falls back to a built-in copy of the same flatly theme and still runs.
 #  Run:
 #    shiny::runApp("app.R")
 # ============================================================================
 
 library(shiny)
 library(shinyjs)
+library(bslib)         # shared UF/IFAS theme (flatly base)
 library(lmerTest)      # loads lme4; provides Kenward-Roger / Satterthwaite ddf
 library(emmeans)
 library(multcomp)      # cld() generic
@@ -42,6 +47,49 @@ library(multcompView)  # letter grouping engine
 library(ggplot2)
 library(DT)
 library(lattice)       # ranef caterpillar plot
+
+# --- Shared UF/IFAS look-and-feel ------------------------------------------
+# components.R is the kit's single source of truth for branding (UF colours,
+# the bslib theme, the IFAS logo title, and small UI atoms). Source it so this
+# app matches the Data Explorer and the other tools. If it isn't alongside
+# app.R, fall back to compact inline definitions so the app still runs.
+if (file.exists("components.R")) {
+  source("components.R", local = FALSE)
+} else {
+  UF_BLUE   <- "#003087"
+  UF_ORANGE <- "#FA4616"
+  UF_COLORS <- c(UF_BLUE, UF_ORANGE, "#2ca25f", "#8856a7")
+  uf_theme  <- function() {
+    bslib::bs_theme(bootswatch = "flatly", primary = UF_BLUE,
+                    secondary = UF_ORANGE, font_scale = 0.95,
+                    "navbar-bg" = UF_BLUE) |>
+      bslib::bs_add_rules(
+        ".shiny-output-error-validation { white-space: nowrap; }")
+  }
+  uf_logo_uri <- function() NULL
+  uf_title <- function(text, logo = uf_logo_uri())
+    shiny::tags$span(
+      if (!is.null(logo))
+        shiny::tags$img(src = logo, height = "51px", alt = "UF/IFAS",
+                        style = "margin-right:12px; vertical-align:middle;"),
+      shiny::tags$span(text, style = "vertical-align:middle;"))
+  label_or <- function(custom, default)
+    if (!is.null(custom) && nzchar(trimws(custom))) custom else default
+  info_tip <- function(..., placement = "right")
+    bslib::tooltip(shiny::tags$span(shiny::icon("circle-question"),
+      style = "color:#aaa;cursor:help;margin-left:5px;font-size:0.82em;"),
+      ..., placement = placement)
+  copy_js <- "
+function DEcopy(id, btn){
+  var el = document.getElementById(id);
+  if(!el) return;
+  var txt = el.innerText || el.textContent || '';
+  navigator.clipboard.writeText(txt).then(function(){
+    if(btn){ var o = btn.innerHTML; btn.innerHTML = 'Copied!'; setTimeout(function(){ btn.innerHTML = o; }, 1200); }
+  });
+}
+"
+}
 
 # Optional packages (R2 / ICC / influence) ---------------------------------
 HAS_PERFORMANCE <- requireNamespace("performance",  quietly = TRUE)
@@ -53,13 +101,12 @@ HAS_INFLUENCEME <- requireNamespace("influence.ME", quietly = TRUE)
 DDF_DEFAULT <- if (HAS_PBKRTEST) "Kenward-Roger" else "Satterthwaite"
 MAX_FIXED   <- 3L
 
-# University of Florida brand palette ---------------------------------------
-#   Orange  #FA4616 (Pantone 172)   Blue #0021A5 (Pantone 287)
-UF_ORANGE   <- "#FA4616"
-UF_BLUE     <- "#0021A5"
+# Brand palette ------------------------------------------------------------
+# UF_BLUE / UF_ORANGE / UF_COLORS come from components.R (the source of truth);
+# these are the extra plot-fill shades the app needs on top of the kit palette.
 UF_CHARCOAL <- "#222222"   # "Swamp Charcoal" for body text
 UF_PLATINUM <- "#F8F9FA"   # light neutral background
-UF_BLUE_LT  <- "#cdd3ef"   # tint of blue for fills
+UF_BLUE_LT  <- "#cdd8ea"   # tint of UF blue for fills
 
 # ---------------------------------------------------------------------------
 #  Helpers: formula construction
@@ -107,7 +154,7 @@ build_formula_string <- function(response, transform, fixed, random,
                                  interactions, slope = NULL,
                                  slope_group = NULL) {
   lhs <- build_lhs(response, transform)
-  
+
   if (length(fixed) == 0) {
     fixed_part <- "1"
   } else if (isTRUE(interactions) && length(fixed) > 1) {
@@ -115,7 +162,7 @@ build_formula_string <- function(response, transform, fixed, random,
   } else {
     fixed_part <- paste(bq(fixed), collapse = " + ")
   }
-  
+
   random_part <- build_random_part(random, slope, slope_group)
   paste(lhs, "~", fixed_part, "+", random_part)
 }
@@ -199,20 +246,20 @@ draw_resid_plots <- function(mod) {
   fitv <- fitted(mod)
   op <- par(mfrow = c(2, 2), mar = c(4.5, 4.5, 2.5, 1))
   on.exit(par(op))
-  
+
   plot(fitv, r, xlab = "Fitted values", ylab = "Residuals",
        main = "Residuals vs Fitted", pch = 19, col = UF_BLUE)
   abline(h = 0, lty = 2, col = "grey40")
   lines(lowess(fitv, r), col = UF_ORANGE, lwd = 2)
-  
+
   qqnorm(r, main = "Normal Q-Q", pch = 19, col = UF_BLUE)
   qqline(r, col = UF_ORANGE, lwd = 2)
-  
+
   plot(fitv, sqrt(abs(scale(r))), xlab = "Fitted values",
        ylab = expression(sqrt(abs("std. residuals"))),
        main = "Scale-Location", pch = 19, col = UF_BLUE)
   lines(lowess(fitv, sqrt(abs(scale(r)))), col = UF_ORANGE, lwd = 2)
-  
+
   hist(r, breaks = "FD", col = UF_BLUE_LT, border = "white",
        xlab = "Residuals", main = "Histogram of residuals")
 }
@@ -246,32 +293,32 @@ make_example_data <- function() {
   d$PlotOrder <- ave(d$Block, d$Block, FUN = seq_along)
   rownames(d) <- NULL
   n <- nrow(d)
-  
+
   bz   <- stats::setNames(rnorm(length(blocks)), as.character(blocks))
   b    <- unname(bz[as.character(d$Block)])
   varV <- unname(c(V1 = 0, V2 = 8, V3 = 4)[d$Variety])
   nitr <- unname(c(`0` = 0, `100` = 6, `200` = 8)[as.character(d$Nitrogen)])
   irr  <- unname(c(Drip = 0, Flood = -3)[d$Irrigation])
-  
+
   # yield: Variety x Nitrogen interaction (V2 gains most at high N)
   inter <- ifelse(d$Variety == "V2" & d$Nitrogen == 200,  7,
-                  ifelse(d$Variety == "V3" & d$Nitrogen == 200, -3, 0))
+           ifelse(d$Variety == "V3" & d$Nitrogen == 200, -3, 0))
   d$yield_kg <- round(50 + varV + nitr + irr + inter + 5 * b +
                         rnorm(n, 0, 2.5), 2)
-  
+
   # height: purely additive main effects
   varH <- unname(c(V1 = 0, V2 = 10, V3 = -5)[d$Variety])
   nitH <- unname(c(`0` = 0, `100` = 5, `200` = 9)[as.character(d$Nitrogen)])
   irrH <- unname(c(Drip = 0, Flood = 4)[d$Irrigation])
   d$height_cm <- round(120 + varH + nitH + irrH + 4 * b + rnorm(n, 0, 3), 1)
-  
+
   # biomass: multiplicative / right-skewed -> log transform
   log_mu <- 3.0 +
     unname(c(V1 = 0, V2 = 0.30, V3 = 0.15)[d$Variety]) +
     unname(c(`0` = 0, `100` = 0.18, `200` = 0.25)[as.character(d$Nitrogen)]) +
     unname(c(Drip = 0, Flood = -0.12)[d$Irrigation]) + 0.20 * b
   d$biomass_g <- round(exp(log_mu + rnorm(n, 0, 0.18)), 1)
-  
+
   # germination: a proportion in (0, 1) -> arcsine-sqrt transform
   linp <- 1.2 +
     unname(c(V1 = 0, V2 = 0.4, V3 = 0.1)[d$Variety]) +
@@ -279,13 +326,13 @@ make_example_data <- function() {
     unname(c(Drip = 0, Flood = -0.5)[d$Irrigation]) + 0.3 * b +
     rnorm(n, 0, 0.30)
   d$germination <- round(stats::plogis(linp), 3)
-  
+
   # pest_count: counts -> sqrt transform
   lam <- exp(1.0 +
-               unname(c(Drip = 0, Flood = 0.5)[d$Irrigation]) +
-               unname(c(V1 = 0, V2 = 0.1, V3 = 0.25)[d$Variety]) + 0.15 * b)
+             unname(c(Drip = 0, Flood = 0.5)[d$Irrigation]) +
+             unname(c(V1 = 0, V2 = 0.1, V3 = 0.25)[d$Variety]) + 0.15 * b)
   d$pest_count <- rpois(n, lam)
-  
+
   d[, c("Block", "Variety", "Nitrogen", "Irrigation", "PlotOrder",
         "yield_kg", "height_cm", "biomass_g", "germination", "pest_count")]
 }
@@ -295,7 +342,7 @@ code_panel <- function(out_id, label = "R code") {
   tags$details(class = "uf-codewrap",
                tags$summary(tags$b(sprintf("\u25b6 %s (copy & run in R)", label))),
                tags$button("Copy code", class = "btn btn-default uf-copy",
-                           onclick = sprintf("copyCode('%s', this)", out_id)),
+                           onclick = sprintf("DEcopy('%s', this)", out_id)),
                verbatimTextOutput(out_id)
   )
 }
@@ -305,109 +352,62 @@ code_panel <- function(out_id, label = "R code") {
 # ===========================================================================
 ui <- fluidPage(
   useShinyjs(),
+  theme = uf_theme(),                       # shared UF/IFAS flatly theme
   title = "Quick Mixed-Model Review",
-  
-  # ---- University of Florida theme ----------------------------------------
-  tags$head(tags$style(HTML(sprintf("
-    :root {
-      --uf-orange: %1$s; --uf-blue: %2$s;
-      --uf-charcoal: %3$s; --uf-platinum: %4$s; --uf-blue-lt: %5$s;
-    }
-    body { background-color: var(--uf-platinum); color: var(--uf-charcoal);
-           font-family: 'Helvetica Neue', Arial, sans-serif; }
 
-    .uf-header { background: var(--uf-blue); color: #fff;
-      padding: 16px 22px; margin: -15px -15px 18px -15px;
-      border-bottom: 6px solid var(--uf-orange); }
-    .uf-header h1 { margin: 0; font-size: 26px; font-weight: 700;
-      letter-spacing: .3px; }
-    .uf-header .uf-sub { color: var(--uf-orange); font-weight: 600;
-      font-size: 14px; margin-top: 2px; }
-
-    .well { background: #fff; border: 1px solid #e3e3e3;
-      border-top: 4px solid var(--uf-orange); border-radius: 6px; }
-
-    .btn-primary { background-color: var(--uf-orange) !important;
-      border-color: var(--uf-orange) !important; color: #fff !important;
-      font-weight: 600; }
-    .btn-primary:hover { background-color: #d83a0f !important;
-      border-color: #d83a0f !important; }
-    .btn-default { background-color: #fff !important;
-      border: 1px solid var(--uf-blue) !important; color: var(--uf-blue) !important;
-      font-weight: 600; }
-    .btn-default:hover { background-color: var(--uf-blue) !important;
-      color: #fff !important; }
-
-    .nav-tabs > li > a { color: var(--uf-blue); font-weight: 600; }
-    .nav-tabs > li.active > a,
-    .nav-tabs > li.active > a:focus,
-    .nav-tabs > li.active > a:hover {
-      color: var(--uf-orange) !important;
-      border-top: 3px solid var(--uf-orange) !important; }
-
-    h4 { color: var(--uf-blue); font-weight: 700; }
-    a { color: var(--uf-blue); }
-    .control-label { color: var(--uf-charcoal); font-weight: 600; }
-    pre { background: #fff; border: 1px solid #e3e3e3;
-      border-left: 4px solid var(--uf-blue); }
-    .alert-warning { border-left: 5px solid var(--uf-orange); }
-    .alert-danger  { border-left: 5px solid var(--uf-orange); }
-    .alert-info    { border-left: 5px solid var(--uf-blue); }
+  # ---- App-specific styling on top of the shared theme --------------------
+  tags$head(
+    tags$style(HTML(sprintf("
+    .uf-header { background: %1$s; color: #fff;
+      padding: 14px 20px; margin: -12px -12px 16px -12px;
+      border-bottom: 5px solid %2$s; }
+    .uf-header .uf-title { font-size: 24px; font-weight: 700; }
+    .uf-header .uf-sub { color: #fff; opacity: .85; font-weight: 600;
+      font-size: 13px; margin-top: 2px; }
+    pre { border-left: 4px solid %1$s; }
+    .alert-warning { border-left: 5px solid %2$s; }
+    .alert-danger  { border-left: 5px solid %2$s; }
+    .alert-info    { border-left: 5px solid %1$s; }
     .uf-dl { margin: 6px 6px 12px 0; }
     .uf-copy { margin: 4px 0 0 0; font-size: 12px; padding: 3px 10px; }
     .uf-codewrap { margin: 6px 0 14px 0; }
     summary { cursor: pointer; user-select: none; padding: 2px 0; }
-    summary:hover { color: var(--uf-orange); }
-  ", UF_ORANGE, UF_BLUE, UF_CHARCOAL, UF_PLATINUM, UF_BLUE_LT))),
-            tags$script(HTML("
-      function copyCode(id, btn){
-        var el = document.getElementById(id);
-        if(!el){ return; }
-        var txt = el.innerText || el.textContent || '';
-        var done = function(){ var o = btn.innerHTML; btn.innerHTML = 'Copied \u2713';
-                               setTimeout(function(){ btn.innerHTML = o; }, 1200); };
-        if(navigator.clipboard && navigator.clipboard.writeText){
-          navigator.clipboard.writeText(txt).then(done, function(){});
-        } else {
-          var ta = document.createElement('textarea'); ta.value = txt;
-          document.body.appendChild(ta); ta.select();
-          try { document.execCommand('copy'); done(); } catch(e){}
-          document.body.removeChild(ta);
-        }
-      }
-    "))),
-  
+    summary:hover { color: %2$s; }
+  ", UF_BLUE, UF_ORANGE))),
+    tags$script(HTML(copy_js))               # shared DEcopy() clipboard helper
+  ),
+
   div(class = "uf-header",
-      h1("Quick Mixed-Model Review"),
+      div(class = "uf-title", uf_title("Quick Mixed-Model Review")),
       div(class = "uf-sub", "lmerTest \u00b7 emmeans  |  University of Florida")),
-  
+
   sidebarLayout(
     sidebarPanel(
       width = 4,
       div(id = "controls",
-          
+
           radioButtons("data_source", "Data source",
                        choices = c("Example data (3-factor RCBD)" = "example",
                                    "Upload a CSV file"          = "upload"),
                        selected = "example"),
-          
+
           conditionalPanel(
             condition = "input.data_source == 'upload'",
             fileInput("file", "Choose CSV file", accept = c(".csv", ".txt")),
             checkboxInput("header", "Header row", TRUE)
           ),
-          
+
           tags$details(open = NA,
-                       tags$summary(tags$b("\u25be Variable types \u2014 treat numbers as categories")),
-                       helpText("If a treatment level or ID is stored as a number (e.g. ",
-                                "Nitrogen 0/100/200, or Block 1\u20136), read it as a factor ",
-                                "so its levels can be compared in the ANOVA and EMMeans. ",
-                                "Otherwise a numeric column is fitted as a continuous slope, ",
-                                "not as separate groups."),
-                       uiOutput("force_factor_ui"),
-                       uiOutput("force_numeric_ui")
+            tags$summary(tags$b("\u25be Variable types \u2014 treat numbers as categories")),
+            helpText("If a treatment level or ID is stored as a number (e.g. ",
+                     "Nitrogen 0/100/200, or Block 1\u20136), read it as a factor ",
+                     "so its levels can be compared in the ANOVA and EMMeans. ",
+                     "Otherwise a numeric column is fitted as a continuous slope, ",
+                     "not as separate groups."),
+            uiOutput("force_factor_ui"),
+            uiOutput("force_numeric_ui")
           ),
-          
+
           tags$details(open = NA,
                        tags$summary(tags$b("\u25be Create combined variable (interaction)")),
                        helpText("Paste 2+ columns into one new factor (e.g. Diet \u00d7 Time), ",
@@ -419,9 +419,9 @@ ui <- fluidPage(
                        actionButton("combo_add", "Create variable", class = "btn-primary"),
                        uiOutput("combo_list_ui")
           ),
-          
+
           tags$hr(),
-          
+
           uiOutput("response_ui"),
           selectInput("transform", "Response transformation",
                       choices = c("None"             = "none",
@@ -431,13 +431,13 @@ ui <- fluidPage(
                                   "inverse (1/y)"    = "inverse",
                                   "arcsine-sqrt (proportions)" = "asin"),
                       selected = "none"),
-          
+
           uiOutput("fixed_ui"),
           checkboxInput("interactions",
                         "Include interactions among fixed effects", FALSE),
-          
+
           uiOutput("random_ui"),
-          
+
           # ---- Advanced model options ----
           tags$details(
             tags$summary(tags$b("\u25b8 Advanced model options")),
@@ -460,9 +460,9 @@ ui <- fluidPage(
                      "contrasts so they are interpretable. Kenward-Roger df ",
                      "requires REML and is auto-switched to Satterthwaite under ML.")
           ),
-          
+
           tags$hr(),
-          
+
           uiOutput("emm_ui"),
           uiOutput("emm_by_ui"),
           checkboxInput("backtransform",
@@ -476,7 +476,7 @@ ui <- fluidPage(
                       selected = "tukey"),
           sliderInput("conf", "Confidence level", min = 0.80, max = 0.99,
                       value = 0.95, step = 0.01),
-          
+
           tags$hr(),
           actionButton("run", "Run analysis", class = "btn-primary"),
           actionButton("reset", "Reset", class = "btn-default"),
@@ -484,14 +484,14 @@ ui <- fluidPage(
                        class = "btn-default", style = "margin-top:8px;")
       )
     ),
-    
+
     mainPanel(
       width = 8,
       uiOutput("message_box"),
-      
+
       tabsetPanel(
         id = "tabs",
-        
+
         tabPanel("Data",
                  h4("Dimensions"),
                  verbatimTextOutput("data_dims"),
@@ -503,7 +503,7 @@ ui <- fluidPage(
                  DT::dataTableOutput("data_na"),
                  h4("Preview (first 10 rows)"),
                  DT::dataTableOutput("data_head")),
-        
+
         tabPanel("Explore (raw data)",
                  h4("Design balance (cell counts)"),
                  helpText("Counts per combination of the selected categorical ",
@@ -523,16 +523,16 @@ ui <- fluidPage(
                           "fixed effects."),
                  plotOutput("interaction_plot", height = "440px"),
                  code_panel("code_interaction", "Interaction plot code")),
-        
+
         tabPanel("Model & code",
                  h4("R code for this model"),
                  verbatimTextOutput("code_block"),
                  tags$button("Copy code", class = "btn btn-default uf-copy",
-                             onclick = "copyCode('code_block', this)"),
+                             onclick = "DEcopy('code_block', this)"),
                  downloadButton("dl_code", "Download .R", class = "btn-default uf-dl"),
                  h4("Model summary"),
                  verbatimTextOutput("model_summary")),
-        
+
         tabPanel("Fit & variance",
                  h4("Fit statistics"),
                  DT::dataTableOutput("fit_table"),
@@ -546,12 +546,12 @@ ui <- fluidPage(
                           "distributed. Points should hug the line."),
                  plotOutput("ranef_qq", height = "420px"),
                  code_panel("code_fit", "Fit, variance & random-effects code")),
-        
+
         tabPanel("ANOVA",
                  h4(textOutput("anova_title", inline = TRUE)),
                  verbatimTextOutput("anova_table"),
                  code_panel("code_anova", "ANOVA code")),
-        
+
         tabPanel("Residuals",
                  h4("Diagnostic plots"),
                  plotOutput("resid_plot", height = "560px"),
@@ -564,7 +564,7 @@ ui <- fluidPage(
                  plotOutput("cook_plot", height = "380px"),
                  htmlOutput("cook_help"),
                  code_panel("code_cook", "Cook's distance code")),
-        
+
         tabPanel("EMMeans & post-hoc",
                  uiOutput("emm_note"),
                  h4("Estimated marginal means"),
@@ -586,7 +586,7 @@ ui <- fluidPage(
                           "geometric mean for log), not arithmetic means, and ",
                           "log-scale differences are shown as ratios."),
                  code_panel("code_emm", "EMMeans + post-hoc + cld code")),
-        
+
         tabPanel("Interaction test",
                  helpText("Letters tell you which cells differ; they do not tell ",
                           "you whether an interaction is real. The omnibus F-tests ",
@@ -602,13 +602,13 @@ ui <- fluidPage(
                           "no 'compare within' factor is set."),
                  verbatimTextOutput("inter_contrast_table"),
                  code_panel("code_joint", "Interaction test code")),
-        
+
         tabPanel("EMMeans plot",
                  h4("Estimated means with letter groupings"),
                  plotOutput("emm_plot", height = "520px"),
                  downloadButton("dl_emmplot", "Download PNG", class = "btn-default uf-dl"),
                  code_panel("code_emmplot", "EMMeans plot code")),
-        
+
         tabPanel("Compare models",
                  helpText("Use 'Save model for comparison' on a fitted model, ",
                           "then change the spec, Run again, and compare here."),
@@ -625,7 +625,7 @@ ui <- fluidPage(
 #  Server
 # ===========================================================================
 server <- function(input, output, session) {
-  
+
   rv <- reactiveValues(
     reset    = 0,
     fit      = NULL,
@@ -637,7 +637,7 @@ server <- function(input, output, session) {
     modelA   = NULL,   # saved model for comparison
     combos   = list()  # user-created combined (interaction) variables
   )
-  
+
   # -- Data ------------------------------------------------------------------
   raw_data <- reactive({
     if (input$data_source == "example") {
@@ -660,7 +660,7 @@ server <- function(input, output, session) {
     })
     df
   })
-  
+
   # Apply optional type overrides, then append any user-created combined
   # (interaction) variables. Each combo pastes 2+ existing columns into a new
   # factor, so a model can use an interaction as a single clean grouping.
@@ -679,7 +679,7 @@ server <- function(input, output, session) {
     }
     df
   })
-  
+
   # Type-override selectors (built from raw column names, cleared on reset)
   output$force_factor_ui <- renderUI({
     df <- raw_data(); req(df); rv$reset
@@ -703,14 +703,14 @@ server <- function(input, output, session) {
     selectInput("force_numeric", "Treat as numeric (continuous)",
                 choices = names(df), multiple = TRUE)
   })
-  
+
   # -- Combined-variable (interaction) builder -------------------------------
   output$combo_vars_ui <- renderUI({
     df <- raw_data(); req(df); rv$reset
     selectInput("combo_vars", "Columns to combine (pick 2 or more)",
                 choices = names(df), multiple = TRUE)
   })
-  
+
   observeEvent(input$combo_add, {
     vars <- input$combo_vars
     if (length(vars) < 2) {
@@ -730,12 +730,12 @@ server <- function(input, output, session) {
       "Created combined variable '%s' from %s (%d level%s). It is now available as a fixed/random effect and for EMMeans, and is included when you download the data.",
       name, paste(vars, collapse = " + "), n_lev, if (n_lev == 1) "" else "s"))
   })
-  
+
   observeEvent(input$combo_clear, {
     rv$combos <- list()
     rv$message <- list(type = "info", text = "Removed all created combined variables.")
   })
-  
+
   output$combo_list_ui <- renderUI({
     if (!length(rv$combos))
       return(helpText("No combined variables yet."))
@@ -745,7 +745,7 @@ server <- function(input, output, session) {
       actionButton("combo_clear", "Clear created variables", class = "btn-default")
     )
   })
-  
+
   # -- Data-preview outputs --------------------------------------------------
   output$data_dims <- renderPrint({
     df <- dataset(); req(df)
@@ -773,7 +773,7 @@ server <- function(input, output, session) {
     DT::datatable(head(df, 10), options = list(dom = "t", scrollX = TRUE),
                   rownames = FALSE)
   })
-  
+
   # -- Explore (raw data, pre-model) ----------------------------------------
   # -- Design balance (raw cell counts, pre-model) --------------------------
   output$balance_table <- DT::renderDataTable({
@@ -790,7 +790,7 @@ server <- function(input, output, session) {
                     backgroundColor = DT::styleEqual(0, "#ffd6cc"),
                     fontWeight      = DT::styleEqual(0, "bold"))
   })
-  
+
   output$explore_plot <- renderPlot({
     df <- dataset(); req(df)
     resp <- input$response; fx <- input$fixed
@@ -798,7 +798,7 @@ server <- function(input, output, session) {
              need(length(fx) >= 1, "Select at least one fixed effect to explore."))
     x <- fx[1]
     cat_x <- is.factor(df[[x]]) || is.character(df[[x]])
-    
+
     p <- ggplot(df, aes(x = .data[[x]], y = .data[[resp]]))
     if (cat_x) {
       p <- p +
@@ -823,7 +823,7 @@ server <- function(input, output, session) {
       theme_minimal(base_size = 14) +
       theme(plot.title = element_text(face = "bold", colour = UF_BLUE))
   })
-  
+
   output$interaction_plot <- renderPlot({
     df <- dataset(); req(df)
     resp <- input$response; fx <- input$fixed
@@ -832,22 +832,21 @@ server <- function(input, output, session) {
                   "Select at least two fixed effects to see an interaction plot."))
     x <- fx[1]; trace <- fx[2]
     facet3 <- if (length(fx) >= 3) fx[3] else NULL
-    
+
     # Use only complete cases across the variables in play, and report drops
     cols <- c(resp, x, trace, facet3)
     cc   <- stats::complete.cases(df[cols])
     n_drop <- sum(!cc)
     df <- df[cc, , drop = FALSE]
     validate(need(nrow(df) > 0, "No complete rows for the selected variables."))
-    
+
     grp_list <- list(X = factor(df[[x]]), G = factor(df[[trace]]))
     if (!is.null(facet3)) grp_list$F3 <- factor(df[[facet3]])
     ag <- aggregate(df[[resp]], by = grp_list,
                     FUN = function(z) mean(z, na.rm = TRUE))
     names(ag)[names(ag) == "x"] <- "mean"
     n_lev <- nlevels(ag$G)
-    uf_pal <- rep(c(UF_BLUE, UF_ORANGE, "#5a7adf", "#ff8a5c"),
-                  length.out = max(n_lev, 1))
+    uf_pal <- rep(UF_COLORS, length.out = max(n_lev, 1))
     subt <- if (n_drop > 0)
       sprintf("%d row(s) with missing values dropped", n_drop) else NULL
     p <- ggplot(ag, aes(x = X, y = mean, colour = G, group = G)) +
@@ -861,7 +860,7 @@ server <- function(input, output, session) {
       theme(plot.title = element_text(face = "bold", colour = UF_BLUE),
             legend.title = element_text(colour = UF_CHARCOAL))
   })
-  
+
   # -- Dynamic variable selectors -------------------------------------------
   output$response_ui <- renderUI({
     df <- dataset(); req(df); rv$reset
@@ -870,7 +869,7 @@ server <- function(input, output, session) {
                   "No numeric columns available for a response variable."))
     selectInput("response", "Response variable (numeric)", choices = num_cols)
   })
-  
+
   output$fixed_ui <- renderUI({
     df <- dataset(); req(df); rv$reset
     selectizeInput("fixed",
@@ -879,13 +878,13 @@ server <- function(input, output, session) {
                    options = list(maxItems = MAX_FIXED,
                                   placeholder = "select 1-3 variables"))
   })
-  
+
   output$random_ui <- renderUI({
     df <- dataset(); req(df); rv$reset
     selectInput("random", "Random effects  (grouping factors)",
                 choices = names(df), multiple = TRUE)
   })
-  
+
   # Optional random slope (one of the chosen fixed effects)
   output$slope_ui <- renderUI({
     df <- dataset(); req(df)
@@ -895,7 +894,7 @@ server <- function(input, output, session) {
                 choices = c("(intercept only)" = "", fx),
                 selected = "")
   })
-  
+
   # Which grouping factor(s) the random slope applies to. Only shown once a
   # slope variable is chosen and there are random effects to attach it to.
   # Defaults to the first random effect, since a slope usually belongs to one
@@ -908,7 +907,7 @@ server <- function(input, output, session) {
                 "Apply random slope to which grouping factor(s)?",
                 choices = rnd, selected = rnd[1], multiple = TRUE)
   })
-  
+
   # EMMeans only over categorical fixed effects
   output$emm_ui <- renderUI({
     df <- dataset(); req(df)
@@ -918,7 +917,7 @@ server <- function(input, output, session) {
                 "EMMeans over (categorical fixed effects only)",
                 choices = cat_fixed, multiple = TRUE)
   })
-  
+
   # Optional conditioning factor: turns the spec into ~ A | B so comparisons /
   # letters are simple effects (A within each level of B) instead of all-cells.
   output$emm_by_ui <- renderUI({
@@ -927,7 +926,7 @@ server <- function(input, output, session) {
                 choices = c("(none \u2014 compare all cells)" = "", input$emmvars),
                 selected = "")
   })
-  
+
   # -- Reset -----------------------------------------------------------------
   observeEvent(input$reset, {
     rv$reset    <- rv$reset + 1
@@ -947,17 +946,17 @@ server <- function(input, output, session) {
     updateCheckboxInput(session, "backtransform", value = TRUE)
     updateSliderInput(session, "conf", value = 0.95)
   })
-  
+
   # -- Fit the model on demand ----------------------------------------------
   observeEvent(input$run, {
     df <- dataset(); req(df)
-    
+
     response  <- input$response
     transform <- input$transform
     fixed     <- input$fixed
     random    <- input$random
     slope     <- input$ranslope
-    
+
     # --- Validation: keep lmer from erroring --------------------------------
     problems <- character(0)
     if (is.null(fixed) || length(fixed) == 0)
@@ -979,12 +978,12 @@ server <- function(input, output, session) {
       problems <- c(problems, sprintf(
         "Variable(s) %s are selected as both fixed and random effects, which confounds the fixed estimate with the grouping. Use each variable in only one role.",
         paste(intersect(fixed, random), collapse = ", ")))
-    
+
     if (length(problems)) {
       rv$message <- list(type = "warning", text = problems); rv$fit <- NULL; rv$code <- NULL
       return()
     }
-    
+
     # --- Transformation sanity checks ---------------------------------------
     y <- df[[response]]
     bad <- switch(transform,
@@ -997,11 +996,11 @@ server <- function(input, output, session) {
     if (!is.null(bad)) {
       rv$message <- list(type = "error", text = bad); rv$fit <- NULL; rv$code <- NULL; return()
     }
-    
+
     # --- Coerce random-effect grouping variables to factors -----------------
     model_df <- df
     for (g in random) model_df[[g]] <- factor(model_df[[g]])
-    
+
     # --- Degenerate-factor guards (clearer than lmer's raw errors) ----------
     # Evaluate on the rows lmer will actually use (complete cases of the model
     # variables), so a factor that collapses to one level after listwise
@@ -1027,7 +1026,7 @@ server <- function(input, output, session) {
       rv$message <- list(type = "warning", text = deg)
       rv$fit <- NULL; rv$code <- NULL; return()
     }
-    
+
     # --- Build & fit --------------------------------------------------------
     use_slope <- if (!is.null(slope) && nzchar(slope)) slope else NULL
     # Restrict the slope to the chosen grouping factor(s); default to the first
@@ -1036,7 +1035,7 @@ server <- function(input, output, session) {
       g <- intersect(input$ranslope_group, random)
       if (length(g)) g else random[1]
     } else NULL
-    
+
     fml_str <- build_formula_string(response, transform, fixed, random,
                                     input$interactions, use_slope,
                                     use_slope_group)
@@ -1044,7 +1043,7 @@ server <- function(input, output, session) {
     use_reml <- input$estimator == "reml"
     atype    <- input$anova_type    # "2" or "3"
     has_inter <- isTRUE(input$interactions) && length(fixed) > 1
-    
+
     # Type III main-effect tests are contrast-dependent ONLY when interactions
     # are present; sum-to-zero coding makes them interpretable. Without
     # interactions, Type III == Type II and is contrast-invariant, so we keep
@@ -1053,12 +1052,12 @@ server <- function(input, output, session) {
     contr_arg <- if (apply_sum)
       stats::setNames(as.list(rep("contr.sum", length(cat_fixed))), cat_fixed)
     else NULL
-    
+
     # Kenward-Roger df is defined for REML; auto-switch under ML.
     eff_ddf <- input$ddf
     ddf_switched <- (!use_reml && eff_ddf == "Kenward-Roger")
     if (ddf_switched) eff_ddf <- "Satterthwaite"
-    
+
     fit_warnings <- character(0)
     fit <- tryCatch(
       withCallingHandlers(
@@ -1075,7 +1074,7 @@ server <- function(input, output, session) {
                          text = paste("Model failed to fit:", conditionMessage(fit)))
       rv$fit <- NULL; rv$code <- NULL; return()
     }
-    
+
     # --- Soft diagnostics (singular / convergence / dropped rows / ddf) ------
     notes <- character(0)
     n_drop <- nrow(model_df) - stats::nobs(fit)
@@ -1089,7 +1088,7 @@ server <- function(input, output, session) {
     if (apply_sum)
       notes <- c(notes,
                  "Type III ANOVA with interactions: sum-to-zero contrasts were applied to categorical fixed effects so the main-effect tests are interpretable. (This also re-codes the summary() coefficients as deviations from the grand mean.)")
-    
+
     # Random effects with very few levels give unreliable variance estimates.
     ng <- tryCatch(lme4::ngrps(fit), error = function(e) NULL)
     if (!is.null(ng)) {
@@ -1099,7 +1098,7 @@ server <- function(input, output, session) {
           "Random effect '%s' has only %d level(s). Variance components estimated from fewer than ~5 levels are unreliable \u2014 consider modelling it as a fixed effect instead.",
           g, few[[g]]))
     }
-    
+
     # Combine warnings raised during the fit with lme4's stored convergence
     # messages, de-duplicated, so the user sees them in the UI (not just the log).
     conv_msg  <- fit@optinfo$conv$lme4$messages
@@ -1124,7 +1123,7 @@ server <- function(input, output, session) {
         "The estimates can still be reported, but treat the affected variance ",
         "components and their SEs with caution."))
     rv$message <- if (length(notes)) list(type = "info", text = notes) else NULL
-    
+
     rv$fit <- list(mod = fit, fml = fml, fml_str = fml_str,
                    response = response, transform = transform,
                    fixed = fixed, random = random, slope = use_slope,
@@ -1133,7 +1132,7 @@ server <- function(input, output, session) {
                    sum_contrasts = apply_sum,
                    cat_fixed = cat_fixed, data = model_df)
     rv$cook <- NULL; rv$cook_err <- NULL   # influence belongs to a specific fit
-    
+
     # --- Generated, copy-pasteable R code -----------------------------------
     emmvars <- input$emmvars
     spec_str <- if (length(emmvars))
@@ -1146,14 +1145,14 @@ server <- function(input, output, session) {
     else
       sprintf('emm <- emmeans(mod, %s, type = "%s", level = %s)',
               spec_str, if (bt) "response" else "link", format(input$conf))
-    
+
     # Reflect Type III sum-to-zero contrasts in the reproducible code
     contr_code <- if (apply_sum)
       sprintf(",\n            contrasts = list(%s)",
               paste(sprintf('%s = "contr.sum"', bq(cat_fixed)), collapse = ", "))
     else ""
     type_roman <- if (atype == "3") "III" else "II"
-    
+
     rv$code <- paste(
       "library(lmerTest)   # loads lme4, adds K-R / Satterthwaite ddf",
       "library(emmeans)",
@@ -1181,10 +1180,10 @@ server <- function(input, output, session) {
               input$adjust),
       sep = "\n"
     )
-    
+
     updateTabsetPanel(session, "tabs", selected = "ANOVA")
   })
-  
+
   # -- Message box -----------------------------------------------------------
   output$message_box <- renderUI({
     m <- rv$message; if (is.null(m)) return(NULL)
@@ -1193,7 +1192,7 @@ server <- function(input, output, session) {
     lbl <- switch(m$type, error = "Error: ", info = "Note: ", "Heads up: ")
     div(class = cls, tags$b(lbl), tags$ul(lapply(m$text, tags$li)))
   })
-  
+
   # -- Model & code outputs --------------------------------------------------
   output$code_block <- renderText({ req(rv$code); rv$code })
   output$model_summary <- renderPrint({ req(rv$fit); summary(rv$fit$mod) })
@@ -1201,12 +1200,12 @@ server <- function(input, output, session) {
     filename = function() "mixed_model_code.R",
     content  = function(file) writeLines(rv$code %||% "# run an analysis first", file)
   )
-  
+
   # ==========================================================================
   #  Per-section reproducible code (copy & run against your own `dat`/`mod`)
   # ==========================================================================
   HDR <- "# Assumes: `dat` is your data frame, and `mod` is the fitted model\n# from the 'Model & code' tab (run that block first).\n"
-  
+
   emm_spec_str <- function() {
     ev <- input$emmvars
     if (length(ev)) emm_spec_text(ev, input$emm_by) else "~ <factor>"
@@ -1221,7 +1220,7 @@ server <- function(input, output, session) {
       sprintf('emm <- emmeans(mod, %s, type = "%s", level = %s)',
               emm_spec_str(), if (bt) "response" else "link", format(input$conf))
   }
-  
+
   # ---- Explore: descriptive plot ----
   output$code_explore <- renderText({
     resp <- input$response; fx <- input$fixed
@@ -1244,7 +1243,7 @@ server <- function(input, output, session) {
            sprintf("ggplot(dat, aes(x = %s, y = %s)) +\n", bq(x), bq(resp)),
            geom, " +\n  theme_minimal()", fl)
   })
-  
+
   # ---- Explore: interaction plot ----
   output$code_interaction <- renderText({
     resp <- input$response; fx <- input$fixed
@@ -1266,7 +1265,7 @@ server <- function(input, output, session) {
            " +\n  labs(x = \"", x, "\", colour = \"", tr, "\", y = \"mean ", resp, "\") +\n",
            "  theme_minimal()")
   })
-  
+
   # ---- Fit & variance ----
   output$code_fit <- renderText({
     if (is.null(rv$fit)) return("# Run a model first.")
@@ -1285,14 +1284,14 @@ server <- function(input, output, session) {
            sprintf("re <- ranef(mod)[[\"%s\"]][[1]]\n", g1),
            "qqnorm(re); qqline(re)")
   })
-  
+
   # ---- ANOVA ----
   output$code_anova <- renderText({
     if (is.null(rv$fit)) return("# Run a model first.")
     paste0(HDR, "\n", sprintf('anova(mod, type = "%s", ddf = "%s")',
                               if (rv$fit$atype == "3") "III" else "II", rv$fit$ddf))
   })
-  
+
   # ---- Residual diagnostics ----
   output$code_resid <- renderText({
     if (is.null(rv$fit)) return("# Run a model first.")
@@ -1307,7 +1306,7 @@ server <- function(input, output, session) {
            "hist(r, breaks = \"FD\", main = \"Histogram of residuals\")\n",
            "par(op)")
   })
-  
+
   # ---- Cook's distance ----
   output$code_cook <- renderText({
     if (is.null(rv$fit)) return("# Run a model first.")
@@ -1319,7 +1318,7 @@ server <- function(input, output, session) {
            "plot(infl, which = \"cook\", sort = TRUE,\n",
            "     cutoff = 4 / length(cooks.distance(infl)))")
   })
-  
+
   # ---- EMMeans + post-hoc + cld ----
   output$code_emm <- renderText({
     if (is.null(rv$fit)) return("# Run a model first.")
@@ -1332,7 +1331,7 @@ server <- function(input, output, session) {
            sprintf('cld(emm, Letters = letters, adjust = "%s", reversed = TRUE)',
                    input$adjust))
   })
-  
+
   # ---- Interaction test ----
   output$code_joint <- renderText({
     if (is.null(rv$fit)) return("# Run a model first.")
@@ -1347,7 +1346,7 @@ server <- function(input, output, session) {
            else
              "# emm <- emmeans(mod, ~ A * B)\n# contrast(emm, interaction = \"pairwise\")")
   })
-  
+
   # ---- EMMeans plot ----
   output$code_emmplot <- renderText({
     if (is.null(rv$fit)) return("# Run a model first.")
@@ -1385,7 +1384,7 @@ server <- function(input, output, session) {
     }
     paste0(base, plt)
   })
-  
+
   # ---- Model comparison ----
   output$code_compare <- renderText({
     if (is.null(rv$modelA))
@@ -1397,7 +1396,7 @@ server <- function(input, output, session) {
       "anova(mod_A, mod)\n",
       "AIC(mod_A, mod); BIC(mod_A, mod)")
   })
-  
+
   # -- Fit statistics & variance components ----------------------------------
   output$fit_table <- DT::renderDataTable({
     req(rv$fit); mod <- rv$fit$mod
@@ -1435,7 +1434,7 @@ server <- function(input, output, session) {
                       Value = round(unlist(stats), 4), row.names = NULL)
     DT::datatable(tab, options = list(dom = "t", pageLength = 25), rownames = FALSE)
   })
-  
+
   output$fit_help <- renderUI({
     req(rv$fit)
     extra <- if (!HAS_PERFORMANCE && !HAS_MUMIN)
@@ -1446,13 +1445,13 @@ server <- function(input, output, session) {
       "<b>ICC</b> is the share of variance attributable to the grouping factor(s). ",
       "Lower AIC/BIC indicate better relative fit.", extra, "</div>"))
   })
-  
+
   output$vc_table <- DT::renderDataTable({
     req(rv$fit)
     vc <- as.data.frame(lme4::VarCorr(rv$fit$mod))
     DT::datatable(round_df(vc), options = list(dom = "t"), rownames = FALSE)
   })
-  
+
   output$ranef_plot <- renderPlot({
     req(rv$fit)
     re  <- lme4::ranef(rv$fit$mod, condVar = TRUE)
@@ -1467,7 +1466,7 @@ server <- function(input, output, session) {
         print(dps[[i]], split = c(1, i, 1, n), more = (i < n))
     }
   })
-  
+
   output$ranef_qq <- renderPlot({
     req(rv$fit)
     re <- lme4::ranef(rv$fit$mod)
@@ -1487,7 +1486,7 @@ server <- function(input, output, session) {
       theme_minimal(base_size = 13) +
       theme(plot.title = element_text(face = "bold", colour = UF_BLUE))
   })
-  
+
   # -- ANOVA -----------------------------------------------------------------
   output$anova_title <- renderText({
     req(rv$fit)
@@ -1503,7 +1502,7 @@ server <- function(input, output, session) {
       warning = function(w) {
         warns <<- c(warns, conditionMessage(w)); invokeRestart("muffleWarning")
       })
-    
+
     a <- tryCatch(run_anova(rv$fit$ddf), error = function(e) e)
     if (inherits(a, "error")) {
       cat("Requested ddf failed (", conditionMessage(a),
@@ -1512,7 +1511,7 @@ server <- function(input, output, session) {
     }
     if (inherits(a, "error")) { cat("ANOVA failed:", conditionMessage(a)); return() }
     print(a)
-    
+
     # Flag non-finite p-values / denominator df (the cause of pf() NaN warnings)
     pcol    <- intersect(c("Pr(>F)", "p.value"), names(a))
     bad_p   <- length(pcol) && any(!is.finite(a[[pcol[1]]]))
@@ -1526,7 +1525,7 @@ server <- function(input, output, session) {
           "predictors, then refit. The F statistics shown are still informative; only\n",
           "the affected p-values are unreliable.", sep = "")
   })
-  
+
   # -- Residual diagnostics --------------------------------------------------
   output$resid_plot <- renderPlot({ req(rv$fit); draw_resid_plots(rv$fit$mod) })
   output$dl_resid <- downloadHandler(
@@ -1551,52 +1550,92 @@ server <- function(input, output, session) {
       "</ul>For mixed models these check the residuals only; gross departures are ",
       "what matter for a quick review, not tiny wiggles.</div>"))
   })
-  
+
   # -- Influence: leave-one-group-out Cook's distance (on demand) ------------
   output$infl_ui <- renderUI({
     req(rv$fit)
-    if (!HAS_INFLUENCEME)
-      return(div(class = "alert alert-info",
-                 "Install the 'influence.ME' package to enable ",
-                 "leave-one-group-out Cook's distance."))
     tagList(
       selectInput("infl_group", "Grouping factor to assess",
                   choices = rv$fit$random),
       actionButton("run_infl", "Compute influence (can be slow)",
                    class = "btn-default"),
-      helpText("Refits the model dropping each level of the chosen factor ",
-               "in turn \u2014 this can take a while on large data.")
+      helpText("Refits the model dropping each level of the chosen factor in ",
+               "turn (leave-one-group-out) and reports each group's Cook's ",
+               "distance on the fixed effects \u2014 this can take a while on ",
+               "large data.")
     )
   })
-  
+
   observeEvent(input$run_infl, {
-    req(rv$fit, HAS_INFLUENCEME, input$infl_group)
-    withProgress(message = "Refitting (leave-one-group-out)...", value = 0.5, {
-      infl <- tryCatch(
-        influence.ME::influence(rv$fit$mod, group = input$infl_group),
-        error = function(e) e)
+    req(rv$fit, input$infl_group)
+    # Compute leave-one-group-out Cook's distance directly instead of going
+    # through influence.ME. influence.ME refits by re-evaluating the model's
+    # stored call, which fails inside a Shiny reactive because the call's
+    # variables (data/formula) no longer exist in scope -- and lme4 doesn't keep
+    # the formula's environment, so the usual scoping tricks don't survive.
+    # Here we drive each refit ourselves with the formula and a local data
+    # subset that are in scope at call time, so there's nothing to re-resolve
+    # and no data baked into any call. The statistic is the same one influence.ME
+    # reports for grouped deletion: the standardized change in the fixed effects,
+    #   D_i = (b - b_(-i))' Sigma^{-1} (b - b_(-i)) / p,
+    # with Sigma = vcov(full model) and p = number of fixed-effect parameters.
+    g    <- input$infl_group
+    dat  <- rv$fit$data
+    fml  <- rv$fit$fml
+    environment(fml) <- environment()       # resolve any names locally
+    reml <- isTRUE(rv$fit$reml)
+    beta <- lme4::fixef(rv$fit$mod)
+    Sig  <- as.matrix(stats::vcov(rv$fit$mod))
+
+    res <- withProgress(message = "Refitting (leave-one-group-out)...",
+                        value = 0, {
+      tryCatch({
+        gv   <- factor(dat[[g]])
+        levs <- levels(gv)
+        nlev <- length(levs)
+        validate(need(nlev >= 2,
+                      "Need at least two groups to assess leave-one-group-out influence."))
+        ck <- rep(NA_real_, nlev)
+        for (k in seq_len(nlev)) {
+          incProgress(1 / nlev, detail = sprintf("%d of %d", k, nlev))
+          sub <- dat[gv != levs[k], , drop = FALSE]
+          m_k <- suppressWarnings(tryCatch(
+            lme4::lmer(fml, data = sub, REML = reml, na.action = stats::na.omit),
+            error = function(e) NULL))
+          if (is.null(m_k)) next
+          fk <- lme4::fixef(m_k)
+          nm <- intersect(names(beta), names(fk))     # align (usually identical)
+          if (!length(nm)) next
+          db <- beta[nm] - fk[nm]
+          ck[k] <- tryCatch(
+            as.numeric(crossprod(db, solve(Sig[nm, nm, drop = FALSE], db))) / length(nm),
+            error = function(e) NA_real_)
+        }
+        data.frame(group = levs, cook = ck, stringsAsFactors = FALSE)
+      }, error = function(e) e)
     })
-    if (inherits(infl, "error")) {
-      rv$cook <- NULL; rv$cook_err <- conditionMessage(infl); return()
+
+    if (inherits(res, "error")) {
+      rv$cook <- NULL; rv$cook_err <- conditionMessage(res); return()
     }
-    cd <- tryCatch(cooks.distance(infl), error = function(e) e)
-    if (inherits(cd, "error")) {
-      rv$cook <- NULL; rv$cook_err <- conditionMessage(cd); return()
+    if (all(is.na(res$cook))) {
+      rv$cook <- NULL
+      rv$cook_err <- "Every leave-one-group-out refit failed (the reduced models would not fit)."
+      return()
     }
-    grp <- rownames(cd)
-    if (is.null(grp)) grp <- names(cd)
-    if (is.null(grp)) grp <- as.character(seq_along(as.numeric(cd)))
-    rv$cook     <- data.frame(group = grp, cook = as.numeric(cd))
-    rv$cook_grp <- input$infl_group
+    rv$cook     <- res
+    rv$cook_grp <- g
     rv$cook_err <- NULL
   })
-  
+
   output$cook_plot <- renderPlot({
     req(rv$fit)
     validate(need(is.null(rv$cook_err), paste("Influence failed:", rv$cook_err)))
     d <- rv$cook
     validate(need(!is.null(d), "Click 'Compute influence' to estimate Cook's distance."))
-    cutoff <- 4 / nrow(d)
+    cutoff <- 4 / nrow(d)                     # 4/n over all groups assessed
+    d <- d[is.finite(d$cook), , drop = FALSE] # omit any group whose refit failed
+    validate(need(nrow(d) > 0, "No Cook's distances could be computed."))
     ggplot(d, aes(x = stats::reorder(group, cook), y = cook)) +
       geom_col(fill = UF_BLUE) +
       geom_hline(yintercept = cutoff, linetype = 2, colour = UF_ORANGE,
@@ -1607,7 +1646,7 @@ server <- function(input, output, session) {
       theme_minimal(base_size = 13) +
       theme(plot.title = element_text(face = "bold", colour = UF_BLUE))
   })
-  
+
   output$cook_help <- renderUI({
     req(rv$cook)
     HTML(paste0(
@@ -1616,14 +1655,14 @@ server <- function(input, output, session) {
       "groups; the rule is a flag for a closer look, not an automatic ",
       "delete.</div>"))
   })
-  
+
   # -- EMMeans interpretive notes (additive-model guard + averaged factors) --
   output$emm_note <- renderUI({
     req(rv$fit)
     emmvars <- input$emmvars
     if (length(emmvars) < 1) return(NULL)
     msgs <- character(0)
-    
+
     # (a) Requesting A x B means from a model with no A:B term: the cell means
     # are constrained to be additive, so non-parallel lines would be impossible
     # and the plot must not be read as evidence about an interaction.
@@ -1641,7 +1680,7 @@ server <- function(input, output, session) {
           "Tick 'Include interactions' and re-run to model an interaction; see ",
           "the Interaction test tab for the omnibus F-test."))
     }
-    
+
     # Averaged-over categorical factors are weighted equally (emmeans default),
     # not by cell count -- worth stating alongside the held-covariate caption.
     avg_over <- setdiff(rv$fit$cat_fixed, emmvars)
@@ -1650,12 +1689,12 @@ server <- function(input, output, session) {
         "Averaging over categorical fixed effect(s) <b>",
         paste(avg_over, collapse = ", "), "</b> with equal weights (emmeans ",
         "default), not weighted by cell count."))
-    
+
     if (!length(msgs)) return(NULL)
     div(class = "alert alert-info", tags$b("EMMeans notes:"),
         tags$ul(lapply(msgs, function(m) tags$li(HTML(m)))))
   })
-  
+
   # -- EMMeans computation (live; toggle back-transform / level) -------------
   emm_result <- reactive({
     req(rv$fit)
@@ -1666,18 +1705,18 @@ server <- function(input, output, session) {
     if (!all(emmvars %in% rv$fit$fixed))
       validate(need(FALSE,
                     "Your EMMeans selection no longer matches the fitted model. Click 'Run analysis' again."))
-    
+
     # Spec honours an optional 'compare within' factor: ~ A | B (simple effects)
     roles <- emm_roles(emmvars, input$emm_by)
     spec  <- emm_spec_formula(emmvars, input$emm_by)
     bt    <- rv$fit$transform != "none" && isTRUE(input$backtransform)
     type  <- if (bt) "response" else "link"
-    
+
     # emmeans auto-detects log / sqrt, but NOT inverse / arcsine / log1p.
     # Set the transformation explicitly so back-transformation is correct
     # (and the "(back-transformed)" label is never a lie).
     tran_spec <- tran_for_emmeans(rv$fit$transform)
-    
+
     emm <- tryCatch({
       if (bt && !is.null(tran_spec)) {
         rg <- emmeans::ref_grid(mod, tran = tran_spec)
@@ -1688,7 +1727,7 @@ server <- function(input, output, session) {
     }, error = function(e) e)
     validate(need(!inherits(emm, "error"),
                   paste("EMMeans failed:", if (inherits(emm, "error")) conditionMessage(emm) else "")))
-    
+
     # With a '|' spec, cld()/pairs() correct for multiplicity within each level
     # of the conditioning factor -- the simple-effects family most users intend.
     cld_df <- tryCatch(
@@ -1698,12 +1737,12 @@ server <- function(input, output, session) {
     validate(need(!inherits(cld_df, "error"),
                   "Could not compute letter groupings for this specification."))
     if (".group" %in% names(cld_df)) cld_df$.group <- trimws(cld_df$.group)
-    
+
     prs <- tryCatch(as.data.frame(pairs(emm, adjust = input$adjust)),
                     error = function(e)
                       data.frame(note = paste("Pairwise comparisons unavailable:",
                                               conditionMessage(e))))
-    
+
     # Clarity extras: observations per EMMeans cell, and any continuous
     # covariates emmeans is holding at their mean.
     md <- rv$fit$data
@@ -1719,13 +1758,13 @@ server <- function(input, output, session) {
       paste(sprintf("%s = %.4g", contfx,
                     vapply(contfx, function(v) mean(used[[v]], na.rm = TRUE),
                            numeric(1))), collapse = ", ") else NULL
-    
+
     list(emm = emm, vars = emmvars, roles = roles,
          main_vars = roles$main, by_var = roles$by,
          cld = cld_df, pairs = prs,
          counts = cnt, held = held, backtransformed = bt)
   })
-  
+
   # add the per-cell n to an EMMeans/cld data frame by matching the factor cols
   add_counts <- function(d, cnt, vars) {
     if (is.null(cnt) || !all(vars %in% names(d))) return(d)
@@ -1734,7 +1773,7 @@ server <- function(input, output, session) {
     d$n <- cnt$n[match(keyf(d), keyf(cnt))]
     d
   }
-  
+
   output$emm_table <- DT::renderDataTable({
     er  <- emm_result()
     em  <- add_counts(as.data.frame(er$emm), er$counts, er$vars)
@@ -1763,7 +1802,7 @@ server <- function(input, output, session) {
   output$dl_cld <- downloadHandler(
     filename = function() "cld_letters.csv",
     content  = function(f) write.csv(emm_result()$cld, f, row.names = FALSE))
-  
+
   # -- Interaction test (omnibus F-tests + interaction contrasts) ------------
   output$joint_table <- renderPrint({
     req(rv$fit)
@@ -1779,7 +1818,7 @@ server <- function(input, output, session) {
             sep = "")
     }
   })
-  
+
   output$inter_contrast_table <- renderPrint({
     req(rv$fit)
     emmvars <- input$emmvars
@@ -1810,7 +1849,7 @@ server <- function(input, output, session) {
     if (inherits(ic, "error")) cat("Interaction contrasts failed:", conditionMessage(ic))
     else print(ic)
   })
-  
+
   # -- EMMeans plot with letter groupings ------------------------------------
   build_emm_plot <- function() {
     er    <- emm_result()
@@ -1820,21 +1859,21 @@ server <- function(input, output, session) {
     lcol <- intersect(c("lower.CL", "asymp.LCL", "LCL"), names(cldf))[1]
     ucol <- intersect(c("upper.CL", "asymp.UCL", "UCL"), names(cldf))[1]
     grpcol <- if (".group" %in% names(cldf)) ".group" else NA
-    
+
     ylab <- if (er$backtransformed)
       sprintf("%s (back-transformed)", rv$fit$response) else
         build_lhs(rv$fit$response, rv$fit$transform)
-    
+
     x_var      <- roles$x
     colour_var <- roles$colour
     facet_var  <- roles$facet
-    
+
     cldf[[x_var]] <- factor(cldf[[x_var]])
     if (!is.na(colour_var)) cldf[[colour_var]] <- factor(cldf[[colour_var]])
     if (!is.na(facet_var))  cldf[[facet_var]]  <- factor(cldf[[facet_var]])
-    
+
     ytext <- if (!is.na(ucol)) cldf[[ucol]] else cldf[[valcol]]
-    
+
     if (is.na(colour_var)) {
       p <- ggplot(cldf, aes(x = .data[[x_var]], y = .data[[valcol]])) +
         geom_point(size = 3, colour = UF_BLUE)
@@ -1857,19 +1896,18 @@ server <- function(input, output, session) {
                            vjust = -0.8, position = dodge,
                            fontface = "bold", show.legend = FALSE)
       n_lev <- nlevels(cldf[[colour_var]])
-      uf_pal <- rep(c(UF_BLUE, UF_ORANGE, "#5a7adf", "#ff8a5c"),
-                    length.out = max(n_lev, 1))
+      uf_pal <- rep(UF_COLORS, length.out = max(n_lev, 1))
       p <- p + scale_colour_manual(values = uf_pal)
     }
-    
+
     # conditioning ('by') factor, or a third main factor, becomes facets
     if (!is.na(facet_var))
       p <- p + facet_wrap(stats::reformulate(facet_var))
-    
+
     subt <- if (length(er$by_var))
       sprintf("Letters compare levels within each %s (simple effects)",
               er$by_var[1]) else NULL
-    
+
     p + labs(y = ylab, x = x_var, subtitle = subt,
              title = "Estimated marginal means \u00b1 CI with letter groupings") +
       theme_minimal(base_size = 14) +
@@ -1877,13 +1915,13 @@ server <- function(input, output, session) {
             axis.title = element_text(colour = UF_CHARCOAL),
             legend.title = element_text(colour = UF_CHARCOAL))
   }
-  
+
   output$emm_plot <- renderPlot({ print(build_emm_plot()) })
   output$dl_emmplot <- downloadHandler(
     filename = function() "emmeans_plot.png",
     content  = function(file) ggsave(file, build_emm_plot(), width = 9, height = 6, dpi = 150)
   )
-  
+
   # -- Model comparison ------------------------------------------------------
   observeEvent(input$save_model, {
     if (is.null(rv$fit)) {
@@ -1893,7 +1931,7 @@ server <- function(input, output, session) {
     }
     rv$modelA <- rv$fit
   })
-  
+
   output$compare_status <- renderUI({
     a <- rv$modelA; b <- rv$fit
     if (is.null(a))
@@ -1906,7 +1944,7 @@ server <- function(input, output, session) {
       "<b>Saved (A):</b> <code>", a$fml_str, "</code><br>",
       "<b>Current (B):</b> <code>", cur, "</code></div>"))
   })
-  
+
   output$compare_lrt <- renderPrint({
     a <- rv$modelA; b <- rv$fit
     if (is.null(a) || is.null(b)) {
@@ -1919,7 +1957,7 @@ server <- function(input, output, session) {
       !identical(a$fml_str, b$fml_str)
     random_differ <- !identical(sort(a$random), sort(b$random)) ||
       !identical(a$slope %||% "", b$slope %||% "")
-    
+
     if (!same_resp)
       cat("WARNING: the models use a different response or transformation, so the\n",
           "likelihood is not comparable. A likelihood-ratio test is NOT valid here;\n",
@@ -1941,7 +1979,7 @@ server <- function(input, output, session) {
           "which is the correct basis for this test.\n\n", sep = "")
     cat("The LRT below is valid only if model A is nested within model B (or vice\n",
         "versa) and both are fit on identical data.\n\n")
-    
+
     res <- tryCatch(stats::anova(a$mod, b$mod), error = function(e) e)
     if (inherits(res, "error"))
       cat("Comparison failed:", conditionMessage(res)) else print(res)
